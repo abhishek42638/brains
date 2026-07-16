@@ -54,6 +54,9 @@ SQL_EDITION="ENTERPRISE"              # REQUIRED on PG16+: default is ENTERPRISE
 SQL_STORAGE_SIZE="10GB"
 SQL_STORAGE_TYPE="SSD"
 SQL_CONNECTION_NAME="${PROJECT_ID}:${REGION}:${SQL_INSTANCE}"
+# Local port for the Cloud SQL Auth Proxy that `keys` runs (see mint_keys).
+# Deliberately not 5432 — that is docker-compose's local Postgres.
+KEYS_PROXY_PORT=5433
 
 # --- Service accounts (dedicated, least privilege; never the default compute SA) ---
 RUN_SA="brains-run"                   # the API's own identity
@@ -444,6 +447,87 @@ migrate() {
     --user="${SQL_USER}" --database="${SQL_DB}" --quiet < db/seed.sql || true
 }
 
+# ---------------------------------------------------------------------------
+mint_keys() {
+  log "Minting production API keys against ${SQL_INSTANCE}"
+
+  # Run LOCALLY, on purpose. The obvious alternative — a Cloud Run job running
+  # the same image, which already has the Cloud SQL socket mounted — writes the
+  # keys straight into Cloud Logging, where they are retained, indexed, and
+  # readable by anyone holding roles/logging.viewer. That is the one thing
+  # seed_keys.py exists to prevent: it prints each key once precisely because
+  # `api_keys` stores only sha256(key) and nothing can recover it afterwards.
+  # Printing to the operator's terminal and nowhere else keeps that property.
+  # Nothing below redirects, tees, or captures stdout.
+  #
+  # `gcloud sql connect` (what migrate() uses) is not an option here: it only
+  # wraps psql with a temporarily-authorized IP, and seed_keys.py needs psycopg
+  # to reach the DB, which needs a real local endpoint. Authorizing our own IP
+  # instead would break the invariant setup_sql() rests on — the authorized
+  # networks list stays empty, so the public IP answers to nobody — and a crash
+  # between patch and un-patch would leave the DB exposed with no one watching.
+  # The Auth Proxy needs no authorized networks at all: it authenticates with
+  # IAM ("validates connections using credentials for a user or service
+  # account") and reuses this machine's gcloud credentials, so the operator's
+  # own roles/cloudsql.client is what opens the connection. Verified:
+  # docs.cloud.google.com/sql/docs/postgres/connect-auth-proxy
+  command -v cloud-sql-proxy >/dev/null || {
+    echo "ERROR: cloud-sql-proxy not on PATH."
+    echo "  install:  brew install cloud-sql-proxy"
+    echo "  or see:   docs.cloud.google.com/sql/docs/postgres/connect-auth-proxy"
+    exit 1
+  }
+  command -v uv >/dev/null || { echo "ERROR: uv not on PATH"; exit 1; }
+
+  local db_password
+  db_password="$(gcloud secrets versions access latest --secret="${SECRET_DB_PASSWORD}")"
+
+  # v2 takes the instance connection name positionally; v1's -instances=...=tcp:PORT
+  # is gone. Port 5433, not 5432, and that is a safety choice rather than a
+  # courtesy: docker-compose's local Postgres owns 5432, so on 5432 the proxy
+  # would lose the bind, the readiness probe below would happily connect to the
+  # LOCAL dev database instead, and seed_keys.py would mint production keys into
+  # a docker volume and print them as though they were real. The pid check
+  # leading the loop is the other half of that guard — a dead proxy is caught
+  # before anything is allowed to answer on the port.
+  cloud-sql-proxy --port "${KEYS_PROXY_PORT}" "${SQL_CONNECTION_NAME}" &
+  local proxy_pid=$!
+  # Double quotes so ${proxy_pid} is expanded NOW and the literal pid is baked
+  # into the trap. Single quotes would defer the lookup to EXIT — which fires
+  # after this function has returned and its `local` is gone, so under `set -u`
+  # the trap itself would die on an unbound variable and take the exit status
+  # to 1 on a perfectly successful run.
+  trap "kill ${proxy_pid} 2>/dev/null || true" EXIT
+
+  # The proxy binds its listener only once it is ready to serve, so a successful
+  # connect IS the readiness signal. /dev/tcp is a bash builtin — no nc dependency.
+  log "waiting for the proxy on 127.0.0.1:${KEYS_PROXY_PORT}"
+  local i
+  for i in $(seq 1 40); do
+    kill -0 "${proxy_pid}" 2>/dev/null || { echo "ERROR: proxy exited"; exit 1; }
+    (exec 3<>"/dev/tcp/127.0.0.1/${KEYS_PROXY_PORT}") 2>/dev/null && break
+    sleep 0.5
+    [ "${i}" -lt 40 ] || { echo "ERROR: proxy did not come up"; exit 1; }
+  done
+
+  # DATABASE_URL and PGPASSWORD are passed as REAL environment variables, which
+  # is load-bearing rather than stylistic: config.py loads .env with
+  # override=False, so a real var always wins. Without this, a developer with a
+  # local .env would have seed_keys.py quietly mint "production" keys into their
+  # docker Postgres and print keys that authenticate against nothing.
+  #
+  # The password rides in PGPASSWORD, not in the URL — same split as
+  # deploy_revision() and migrate(), and it keeps the credential out of the URL
+  # that gets echoed around in errors.
+  DATABASE_URL="postgresql://${SQL_USER}@127.0.0.1:${KEYS_PROXY_PORT}/${SQL_DB}" \
+    PGPASSWORD="${db_password}" \
+    uv run python seed_keys.py
+
+  # Idempotent by seed_keys.py's own rule: the two keys are matched by name and
+  # skipped when present, so a re-run prints nothing and mints nothing. Rotating
+  # is a deliberate act — revoke, then re-run.
+}
+
 usage() {
   cat <<EOF
 usage: $0 [all|infra|migrate|keys|url]
@@ -472,6 +556,7 @@ main() {
       log "done. service: ${SERVICE_URL}"
       ;;
     migrate) migrate ;;
+    keys)    mint_keys ;;
     url)     gcloud run services describe "${SERVICE_NAME}" --region="${REGION}" \
                --format='value(status.url)' ;;
     *)       usage; exit 1 ;;
