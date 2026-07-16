@@ -553,3 +553,22 @@ needing `maintenance_work_mem`, and a 7-chunk index is nothing. It is explicitly
 **not covered by the Cloud SQL SLA** ("low-cost test and development instances
 only"), which is the right trade here and the wrong one for production —
 `db-g1-small` (1.7 GB, $32.70/mo) is a `gcloud sql instances patch --tier=` away.
+
+## License
+
+Copyright (C) 2026 Abhishek Baiplawat.
+
+[GNU Affero General Public License v3.0](LICENSE) (AGPL-3.0-or-later).
+
+The AGPL is the GPL plus **section 13**: if you modify BRAINS and let users
+interact with it *over a network* — the only way anyone would ever use an
+HTTP API — you must offer those users the source of your modified version.
+Ordinary open-source licences say nothing about this, because running a
+modified copy on your own server is not "distributing" it. That gap is the
+whole point of the choice here: a competitor may take this and run it as a
+service, but they may not do so and keep their changes.
+
+This is a licence, not a contract with me — you may use, modify, and sell it
+under the AGPL's terms without asking. If those terms don't work for you
+(you want to run a modified BRAINS as a service without publishing the
+changes), that's what a separate commercial licence is for: get in touch.
