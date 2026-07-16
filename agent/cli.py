@@ -6,64 +6,26 @@
     uv run python -m agent.cli approve <id> --by <name>
     uv run python -m agent.cli reject <id> --by <name>
 
-The CLI is deliberately thin: it wires the loop's evidence into the gate and
-persists the decision. It makes no policy choices of its own.
+The CLI is deliberately thin: it binds identity, then hands off to
+decisions.process() — the same write path the API uses. It makes no policy
+choices of its own and owns no SQL for creating decisions.
 """
 
 import argparse
-import asyncio
 import json
 import os
 import sys
 
-from psycopg.types.json import Json
-
+import config  # noqa: F401  — loads .env before anything reads os.environ
+import decisions
 from agent import gate
-from db import execute, query
+from db import query
 
 
-def _last_result(run: dict, tool_name: str):
-    """Most recent result payload for a given tool in the trace, or None."""
-    for it in reversed(run["iterations"]):
-        if it.get("tool") == tool_name and isinstance(it.get("result"), dict):
-            return it["result"]
-    return None
-
-
-def _gather_evidence(run: dict) -> dict:
-    """Reduce the loop's raw trace to the deterministic facts the gate needs.
-
-    The gate never sees the model's opinion — only these facts, pulled from the
-    actual tool results the loop captured.
-    """
-    lookup = _last_result(run, "lookup_lead") or {}
-    crm = _last_result(run, "check_crm") or {}
-    score_res = _last_result(run, "score_lead") or {}
-
-    lead = lookup.get("lead") or {}
-    company = lookup.get("company")  # None if the lead has no company on file
-
-    lead_id = lead.get("id")
-    has_company = company is not None
-
-    lost_deals = sum(1 for d in crm.get("deals", []) if d.get("stage") == "lost")
-    open_tickets = crm.get("open_tickets")
-    if open_tickets is None:
-        open_tickets = sum(
-            1 for t in crm.get("tickets", []) if t.get("status") == "open"
-        )
-
-    return {
-        "lead_id": lead_id,
-        "score": score_res.get("score"),
-        "band": score_res.get("band"),
-        "rules_version": score_res.get("rules_version"),
-        "evidence": {
-            "has_company": has_company,
-            "lost_deals": lost_deals,
-            "open_tickets": open_tickets,
-        },
-    }
+# The CLI's own binding. Least privilege, same as the API's: this is caller
+# code, so it is where identity is decided. See server.py's module docstring.
+CLI_ROLE = "sales"
+CLI_ORG_ID = 1
 
 
 def cmd_qualify(args) -> int:
@@ -72,83 +34,66 @@ def cmd_qualify(args) -> int:
               "to call the Anthropic API.", file=sys.stderr)
         return 2
 
-    import anthropic  # lazy: only this path needs the SDK
+    from agent.loop import identity_of  # lazy: only this path needs the SDK
 
-    from agent.loop import run_qualification  # lazy: only this path needs the API
+    identity = identity_of(CLI_ROLE, CLI_ORG_ID)
 
-    try:
-        run = asyncio.run(run_qualification(args.email))
-    except anthropic.APIError as e:
-        print(f"error: Anthropic API call failed: {e}", file=sys.stderr)
-        return 2
-    facts = _gather_evidence(run)
-
-    proposal = run["proposal"]
-    proposed_action = proposal.get("proposed_action") or "nurture"  # NOT NULL fallback
-
-    gate_result = gate.propose({
-        "score": facts["score"],
-        "proposed_action": proposed_action,
-        "evidence": facts["evidence"],
-    })
-    status = gate_result["status"]
-
-    reasoning = {
-        "iterations": run["iterations"],
-        "final": run["final"],
-        "stop_reason": run["stop_reason"],
-        "tool_calls": run["tool_calls"],
-        "halted": run["halted"],
-        "model": run["model"],
-        # Audit: the privilege the tools actually ran at.
-        "role": run["role"],
-        "org_id": run["org_id"],
-        "evidence": facts["evidence"],
-        "gate": gate_result,
-    }
-
-    rows = execute(
-        "INSERT INTO decisions "
-        "(org_id, lead_id, trigger_input, proposed_action, score, band, "
-        " rules_version, reasoning, status) "
-        "VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s) RETURNING id, status",
-        (
-            1,
-            facts["lead_id"],
-            Json({"email": args.email}),
-            proposed_action,
-            facts["score"],
-            facts["band"],
-            facts["rules_version"],
-            Json(reasoning),
-            status,
-        ),
+    # Same two-phase lifecycle as the API — create in 'processing', then let
+    # decisions.process() drive it to a terminal state. The CLI is synchronous
+    # so it could have gone straight to a final INSERT (it used to), but then
+    # this table would have two shapes of row again, and a CLI run killed
+    # mid-flight would leave no trace at all rather than a reviewable one.
+    decision_id = decisions.create_processing(
+        org_id=CLI_ORG_ID,
+        trigger_input={"email": args.email, "source": "cli"},
+        identity=identity,
     )
-    row = rows[0]
-    print(f"decision id={row['id']} status={row['status']}")
-    print(f"  proposed_action={proposed_action} "
-          f"score={facts['score']} band={facts['band']}")
-    print(f"  gate rule: {gate_result['rule']} — {gate_result['detail']}")
-    if proposal.get("parse_error"):
-        print(f"  NOTE: proposal parse_error: {proposal['parse_error']}",
-              file=sys.stderr)
+    result = decisions.process(  # never raises; never leaves 'processing'
+        decision_id, args.email, org_id=CLI_ORG_ID, role=CLI_ROLE,
+    )
+
+    print(f"decision id={result['id']} status={result['status']}")
+    if result["status"] == decisions.STATUS_NEEDS_REVIEW:
+        print(f"  NEEDS REVIEW: {result['error']}", file=sys.stderr)
+        print("  the run did not produce a decision — it is in the pending "
+              "queue for a human, not silently dropped", file=sys.stderr)
+        return 1
+    print(f"  proposed_action={result['proposed_action']} "
+          f"score={result['score']} band={result['band']}")
+    print(f"  gate rule: {result['gate']['rule']} — {result['gate']['detail']}")
     return 0
 
 
 def cmd_pending(args) -> int:
+    # Same queue as GET /decisions/pending — including needs_review, so a broken
+    # run is visible here too rather than only to whoever reads the API.
     rows = query(
         "SELECT id, lead_id, proposed_action, score, band, status, created_at "
-        "FROM decisions WHERE status = 'pending_approval' ORDER BY id"
+        "FROM decisions WHERE status = ANY(%s) ORDER BY id",
+        (list(decisions.HUMAN_QUEUE_STATUSES),),
     )
     if not rows:
-        print("no pending decisions")
+        print("no decisions awaiting a human")
         return 0
     print(f"{'id':>3}  {'lead':>4}  {'action':<14}  {'score':>5}  "
-          f"{'band':<5}  created_at")
+          f"{'band':<5}  {'status':<16}  created_at")
     for r in rows:
         print(f"{r['id']:>3}  {str(r['lead_id']):>4}  "
               f"{r['proposed_action']:<14}  {str(r['score']):>5}  "
-              f"{str(r['band'] or ''):<5}  {r['created_at']}")
+              f"{str(r['band'] or ''):<5}  {r['status']:<16}  {r['created_at']}")
+    return 0
+
+
+def cmd_sweep(args) -> int:
+    """Rescue rows abandoned in 'processing' by a killed/restarted worker."""
+    swept = decisions.sweep_stuck(older_than_minutes=args.older_than)
+    if not swept:
+        print(f"no decisions stuck in 'processing' for over {args.older_than}m")
+        return 0
+    print(f"swept {len(swept)} abandoned decision(s) -> "
+          f"{decisions.STATUS_NEEDS_REVIEW}:")
+    for r in swept:
+        print(f"  id={r['id']} org={r['org_id']} created_at={r['created_at']}")
     return 0
 
 
@@ -185,8 +130,14 @@ def build_parser() -> argparse.ArgumentParser:
     q.add_argument("email")
     q.set_defaults(func=cmd_qualify)
 
-    pen = sub.add_parser("pending", help="list pending decisions")
+    pen = sub.add_parser("pending", help="list decisions awaiting a human")
     pen.set_defaults(func=cmd_pending)
+
+    sw = sub.add_parser(
+        "sweep", help="rescue decisions abandoned in 'processing' by a dead worker")
+    sw.add_argument("--older-than", type=int, default=decisions.STUCK_AFTER_MINUTES,
+                    metavar="MINUTES", help="age threshold (default: %(default)s)")
+    sw.set_defaults(func=cmd_sweep)
 
     sh = sub.add_parser("show", help="full trace for a decision")
     sh.add_argument("id", type=int)

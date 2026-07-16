@@ -1,24 +1,34 @@
-"""Access-control tests for the knowledge tool.
+"""Access-control tests for the MCP tool gateway.
 
-Two separate claims, tested separately, because they fail in different ways:
+Three claims, tested separately, because they fail in different ways:
 
-  1. IDENTITY IS NOT REACHABLE BY THE MODEL. The `search_knowledge` tool exposes
-     no role/org_id — there is no field a prompt injection could fill, and an
-     attempt to supply one is rejected by the schema rather than honored. These
-     tests need no DB and no network: they monkeypatch the embedder and the db
-     layer and assert on the SQL parameters that come out.
+  1. IDENTITY IS NOT REACHABLE BY THE MODEL. No tool exposes role/org_id — there
+     is no field a prompt injection could fill, and an attempt to supply one is
+     rejected rather than honored. These tests need no DB and no network: they
+     monkeypatch the embedder and the db layer and assert on the SQL parameters
+     that come out.
 
-  2. THE DB ENFORCES THE PERMISSION. `_search_knowledge(role='sales')` returns
-     zero admin-only chunks even when those chunks are the NEAREST match by
-     cosine distance. That claim is only meaningful against real embeddings and
-     real pgvector ordering, so those tests hit Postgres and Voyage and skip
-     when either is unavailable.
+  2. THE DB ENFORCES THE ROLE. `_search_knowledge(role='sales')` returns zero
+     admin-only chunks even when those chunks are the NEAREST match by cosine
+     distance. Only meaningful against real embeddings and real pgvector
+     ordering, so those tests hit Postgres and Voyage and skip when either is
+     unavailable.
 
-Claim 1 without claim 2 is a schema that filters nothing; claim 2 without
-claim 1 is a filter the model can pick the value for. The bug needed both.
+  3. THE DB ENFORCES THE TENANT. A client bound to org 1 cannot see org 2's
+     lead at the same email, its company's deals, or score its lead id — and
+     vice versa. Needs Postgres (seeded with the org-2 duplicates) but no
+     Voyage: only search_knowledge embeds.
+
+Claim 1 without 2/3 is a schema that filters nothing; 2/3 without 1 is a filter
+whose value the model picks. The bug needed both halves, in both dimensions.
+
+Role and tenant are NOT the same severity. A model-chosen role over-reads inside
+its own org; a model-chosen org_id reads another customer's data. Claim 3 is the
+one that would end up in a breach notification.
 """
 
 import asyncio
+import json
 import os
 
 import pytest
@@ -80,13 +90,18 @@ def _schema_of(mcp, tool_name):
     return asyncio.run(go())[tool_name].inputSchema
 
 
-def _call(mcp, args):
-    """Call search_knowledge over a real in-process MCP session, as the model would."""
+def _call_tool(mcp, name, args):
+    """Call any tool over a real in-process MCP session, exactly as the model would."""
     async def go():
         async with Client(mcp) as c:
-            return await c.call_tool("search_knowledge", args)
+            return await c.call_tool(name, args)
 
     return asyncio.run(go())
+
+
+def _call(mcp, args):
+    """Call search_knowledge over a real in-process MCP session, as the model would."""
+    return _call_tool(mcp, "search_knowledge", args)
 
 
 def test_tool_schema_exposes_no_identity_fields():
@@ -218,10 +233,23 @@ def test_agent_system_prompt_does_not_instruct_a_role():
     assert "search_knowledge(query_text)" in loop.SYSTEM_PROMPT
 
 
-def test_api_binds_least_privilege():
+def test_api_has_no_hardcoded_role_left():
+    """Phase 5 replaced the constant with the credential.
+
+    This used to assert `main.CALLER_ROLE == "sales"` — the API bound a
+    hardcoded floor because it had no idea who was calling. It knows now, so the
+    constant is gone and the role comes from the authenticated principal. A
+    CALLER_ROLE reappearing would mean someone re-hardcoded a privilege that
+    should be resolved per caller.
+
+    The positive case — a sales key binds sales, an admin key binds admin — is
+    tests/test_auth.py::test_the_credentials_role_binds_the_gateway.
+    """
     from api import main
 
-    assert main.CALLER_ROLE == "sales"
+    assert not hasattr(main, "CALLER_ROLE"), (
+        "role must come from the credential, not a module constant"
+    )
 
 
 # --------------------------------------------------------------------------- #
@@ -360,3 +388,577 @@ def test_wrong_org_sees_nothing_even_at_admin():
     """org_id is enforced in the same WHERE clause — admin in org 2 sees org 1 nothing."""
     res = server._search_knowledge(VERTEX_QUERY, role="admin", org_id=2)
     assert res["found"] is False
+
+
+# --------------------------------------------------------------------------- #
+# Claim 3: org_id is bound too — the model cannot pick the TENANT
+#
+# Worse failure than the role hole: a model-chosen role over-reads inside its
+# own org, a model-chosen org_id reads ANOTHER CUSTOMER's data. Same fix, so the
+# same shape of test.
+#
+# These need Postgres but no Voyage: lookup/check_crm/score_lead never embed.
+# --------------------------------------------------------------------------- #
+
+ALL_TOOLS = ("lookup_lead", "check_crm", "score_lead", "search_knowledge")
+SHARED_EMAIL = "priya@acmerobotics.com"   # exists in BOTH orgs, by design
+SHARED_COMPANY = "Acme Robotics"          # exists in BOTH orgs, by design
+
+
+def _orgs_seeded() -> bool:
+    """True only if the org-1/org-2 duplicate rows the tests rely on are present."""
+    try:
+        from db import query as real_query
+
+        leads = real_query(
+            "SELECT org_id FROM leads WHERE email = %s", (SHARED_EMAIL,)
+        )
+        org2_deals = real_query("SELECT id FROM deals WHERE org_id = 2")
+        return {r["org_id"] for r in leads} >= {1, 2} and len(org2_deals) > 0
+    except Exception:
+        return False
+
+
+needs_db = pytest.mark.skipif(
+    not _orgs_seeded(),
+    reason="needs Postgres seeded with the org-1/org-2 duplicates "
+           "(docker compose up; psql -f db/seed.sql)",
+)
+
+
+def _lead_id(org_id: int) -> int:
+    from db import query as real_query
+
+    return real_query(
+        "SELECT id FROM leads WHERE email = %s AND org_id = %s",
+        (SHARED_EMAIL, org_id),
+    )[0]["id"]
+
+
+@pytest.mark.parametrize("tool", ALL_TOOLS)
+def test_no_tool_exposes_org_id(tool):
+    """Not one of the four tools lets the model name a tenant."""
+    schema = _schema_of(server.build_mcp(role="sales", org_id=1), tool)
+    assert "org_id" not in schema.get("properties", {}), (
+        f"{tool} exposes org_id — the model could pick the tenant"
+    )
+    assert "role" not in schema.get("properties", {})
+
+
+@pytest.mark.parametrize(
+    "tool,args",
+    [
+        ("lookup_lead", {"email": SHARED_EMAIL, "org_id": 2}),
+        ("check_crm", {"company": SHARED_COMPANY, "org_id": 2}),
+        ("score_lead", {"lead_id": 1, "org_id": 2}),
+        ("search_knowledge", {"query_text": "q", "org_id": 2}),
+    ],
+)
+def test_model_supplied_org_id_is_rejected_on_every_tool(tool, args, spy):
+    """A compromised model naming another tenant fails at the boundary."""
+    mcp = server.build_mcp(role="sales", org_id=1)
+    with pytest.raises(ToolError, match="[Uu]nexpected keyword argument"):
+        _call_tool(mcp, tool, args)
+
+
+@needs_db
+def test_org1_client_sees_org1_lead_not_org2():
+    """Same email, two tenants: org 1's client gets org 1's person."""
+    r = _call_tool(server.build_mcp(role="sales", org_id=1),
+                   "lookup_lead", {"email": SHARED_EMAIL})
+    assert r.data["found"] is True
+    assert r.data["lead"]["first_name"] == "Priya"       # org 1's person
+    assert r.data["lead"]["title"] == "VP of Operations"
+    assert r.data["lead"]["id"] == _lead_id(1)
+    assert r.data["lead"]["first_name"] != "Priyanka"    # org 2's person
+
+
+@needs_db
+def test_org2_client_sees_org2_lead_not_org1():
+    """...and the mirror image. Neither org is privileged; each sees its own."""
+    r = _call_tool(server.build_mcp(role="sales", org_id=2),
+                   "lookup_lead", {"email": SHARED_EMAIL})
+    assert r.data["found"] is True
+    assert r.data["lead"]["first_name"] == "Priyanka"    # org 2's person
+    assert r.data["lead"]["title"] == "Head of Data"
+    assert r.data["lead"]["id"] == _lead_id(2)
+
+
+@needs_db
+def test_the_two_orgs_get_genuinely_different_rows():
+    """The payoff of the (org_id, email) composite unique, exercised end to end.
+
+    One address, two distinct lead ids, two distinct people. If the org filter
+    were dropped, both clients would collapse onto whichever row Postgres
+    returned first — and the tests above would both pass or both fail together
+    depending on physical row order, which is exactly the silent failure this
+    pins down.
+    """
+    one = _lookup_via(1)
+    two = _lookup_via(2)
+    assert one["lead"]["id"] != two["lead"]["id"]
+    assert one["lead"]["first_name"] != two["lead"]["first_name"]
+    assert one["company"]["id"] != two["company"]["id"], (
+        "each org's Acme Robotics is a different company row"
+    )
+
+
+def _lookup_via(org_id: int) -> dict:
+    return _call_tool(server.build_mcp(role="sales", org_id=org_id),
+                      "lookup_lead", {"email": SHARED_EMAIL}).data
+
+
+@needs_db
+def test_check_crm_does_not_leak_other_tenants_deals():
+    """Same company NAME in both tenants; each client sees only its own history."""
+    one = _call_tool(server.build_mcp(role="sales", org_id=1),
+                     "check_crm", {"company": SHARED_COMPANY}).data
+    two = _call_tool(server.build_mcp(role="sales", org_id=2),
+                     "check_crm", {"company": SHARED_COMPANY}).data
+
+    assert one["found"] and two["found"]
+
+    one_blob = json.dumps(one)
+    assert "ORG2-CONFIDENTIAL" not in one_blob, "org 1 leaked org 2's CRM history"
+
+    two_names = [d["name"] for d in two["deals"]]
+    assert any("ORG2-CONFIDENTIAL" in n for n in two_names), (
+        "org 2 should see its own deal — otherwise this test proves nothing"
+    )
+    assert "Acme pilot expansion" not in json.dumps(two), "org 2 leaked org 1's CRM"
+
+
+@needs_db
+def test_score_lead_cannot_score_another_tenants_lead():
+    """lead_id is a GLOBAL key — the org clause is what makes it not-found.
+
+    This is the sharpest one: the model needs no injection at all, just a lead
+    id it saw elsewhere. Without the org filter this returns another tenant's
+    email, title, and firmographics.
+    """
+    org2_lead = _lead_id(2)
+    r = _call_tool(server.build_mcp(role="sales", org_id=1),
+                   "score_lead", {"lead_id": org2_lead})
+    assert r.data == {"found": False}, (
+        f"org 1 scored org 2's lead id {org2_lead}: {r.data}"
+    )
+
+    # ...and it IS scoreable by its own org, so "found: False" above is the
+    # tenant filter talking, not a missing row.
+    ok = _call_tool(server.build_mcp(role="sales", org_id=2),
+                    "score_lead", {"lead_id": org2_lead})
+    assert ok.data["found"] is True
+    assert ok.data["email"] == SHARED_EMAIL
+
+
+@needs_db
+def test_lookup_miss_in_wrong_tenant_is_indistinguishable_from_absent():
+    """A lead that exists only in org 1 reads as simply not-found to org 2."""
+    r = _call_tool(server.build_mcp(role="sales", org_id=2),
+                   "lookup_lead", {"email": "mark@nimbushealth.com"})
+    assert r.data == {"found": False}
+
+
+@needs_db
+def test_internal_functions_take_identity_as_plain_args():
+    """The _-prefixed functions stay directly callable at any tenant — that's the point.
+
+    Safety does not come from these being hard to call; it comes from the only
+    model-reachable path having no tenant parameter.
+    """
+    assert server._lookup_lead(SHARED_EMAIL, org_id=1)["lead"]["first_name"] == "Priya"
+    assert server._lookup_lead(SHARED_EMAIL, org_id=2)["lead"]["first_name"] == "Priyanka"
+    assert server._lookup_lead(SHARED_EMAIL, org_id=999) == {"found": False}
+
+
+# --------------------------------------------------------------------------- #
+# Claim 3b: the org-scoped JOINs and the per-statement org filters
+#
+# These guards defend against rows the seed does not contain: a lead parented to
+# ANOTHER org's company, and a deal/ticket mis-parented across the boundary.
+# With clean data they are redundant — company ids are globally unique, so
+# `WHERE company_id = %s` happens to work — which means a test against clean data
+# passes whether or not the guard exists. Mutation-tested: deleting either guard
+# left the rest of this file green, so the pathological rows below are the only
+# thing standing between "defense in depth" and "untested code that looks safe".
+#
+# Each fixture inserts its own corruption and removes it again, so the seed is
+# unchanged for every other test.
+# --------------------------------------------------------------------------- #
+
+CROSS_ORG_EMAIL = "crossorg-fk@test.invalid"
+
+
+@pytest.fixture
+def cross_org_lead():
+    """An org-1 lead whose company_id points at ORG 2's Acme. Yielded: lead id."""
+    from db import execute
+
+    org2_company = _org2_acme_id()
+    rows = execute(
+        "INSERT INTO leads (org_id, email, first_name, last_name, title, "
+        "company_id, source) VALUES (1, %s, 'Cross', 'Org', 'VP of Operations', "
+        "%s, 'webinar') RETURNING id",
+        (CROSS_ORG_EMAIL, org2_company),
+    )
+    lead_id = rows[0]["id"]
+    try:
+        yield lead_id
+    finally:
+        execute("DELETE FROM leads WHERE id = %s", (lead_id,))
+
+
+@pytest.fixture
+def misparented_crm():
+    """A deal + ticket tagged org 2 but hung off ORG 1's Acme company row."""
+    from db import execute
+
+    org1_company = _org1_acme_id()
+    deal = execute(
+        "INSERT INTO deals (org_id, company_id, name, stage, amount_usd) "
+        "VALUES (2, %s, 'MISPARENTED-ORG2-DEAL', 'won', 1) RETURNING id",
+        (org1_company,),
+    )[0]["id"]
+    ticket = execute(
+        "INSERT INTO tickets (org_id, company_id, subject, status) "
+        "VALUES (2, %s, 'MISPARENTED-ORG2-TICKET', 'open') RETURNING id",
+        (org1_company,),
+    )[0]["id"]
+    try:
+        yield
+    finally:
+        execute("DELETE FROM deals WHERE id = %s", (deal,))
+        execute("DELETE FROM tickets WHERE id = %s", (ticket,))
+
+
+def _org1_acme_id() -> int:
+    from db import query as real_query
+
+    return real_query(
+        "SELECT id FROM companies WHERE org_id = 1 AND name = %s", (SHARED_COMPANY,)
+    )[0]["id"]
+
+
+def _org2_acme_id() -> int:
+    from db import query as real_query
+
+    return real_query(
+        "SELECT id FROM companies WHERE org_id = 2 AND name = %s", (SHARED_COMPANY,)
+    )[0]["id"]
+
+
+@needs_db
+def test_lookup_join_does_not_cross_the_tenant_boundary(cross_org_lead):
+    """A lead must not inherit ANOTHER org's company through its FK.
+
+    The lead itself is correctly scoped to org 1, so the WHERE clause is happy.
+    Only the JOIN's `AND c.org_id = l.org_id` stops org 2's firmographics coming
+    back attached to an org-1 lead.
+    """
+    r = _call_tool(server.build_mcp(role="sales", org_id=1),
+                   "lookup_lead", {"email": CROSS_ORG_EMAIL})
+    assert r.data["found"] is True, "the lead itself is org 1's and must resolve"
+    assert r.data["company"] is None, (
+        f"leaked org 2's company through a cross-org FK: {r.data['company']}"
+    )
+
+
+@needs_db
+def test_score_join_does_not_borrow_another_tenants_firmographics(cross_org_lead):
+    """Size/revenue points must not come from a company in another tenant.
+
+    Without the org-scoped JOIN this lead scores +25 size and +25 revenue off
+    org 2's Acme (1200 employees, $250M) — a cross-tenant read laundered into a
+    number, which is harder to spot than a leaked field.
+    """
+    r = _call_tool(server.build_mcp(role="sales", org_id=1),
+                   "score_lead", {"lead_id": cross_org_lead})
+    assert r.data["found"] is True
+    assert r.data["company"] is None
+    joined = " ".join(r.data["reasons"])
+    assert "no company" in joined.lower(), f"unexpected reasons: {r.data['reasons']}"
+    # title 30 + source 20, and nothing from org 2's company.
+    assert r.data["score"] == 50, f"score {r.data['score']} borrowed org 2's data"
+
+
+@needs_db
+def test_check_crm_deals_and_tickets_carry_their_own_org_filter(misparented_crm):
+    """Resolving the company in-tenant is not enough for the child queries.
+
+    These rows are tagged org 2 but hang off org 1's company row. Fetching by
+    company_id alone returns them to an org-1 caller: the deal query would be
+    relying on the company query's scoping instead of stating its own.
+    """
+    data = _call_tool(server.build_mcp(role="sales", org_id=1),
+                      "check_crm", {"company": SHARED_COMPANY}).data
+    blob = json.dumps(data)
+    assert "MISPARENTED-ORG2-DEAL" not in blob, "deals query ignored org_id"
+    assert "MISPARENTED-ORG2-TICKET" not in blob, "tickets query ignored org_id"
+    assert data["open_tickets"] == 0, "a leaked org-2 ticket would gate the decision"
+
+
+# --------------------------------------------------------------------------- #
+# Claim 4: the binding is part of the RECORD, not just the logs
+#
+# "The agent ran at role=sales, so it could not have seen the postmortems" has
+# to be answerable from the stored row alone — no stderr, no re-run. A trace
+# that shows which tools were called but not what privilege they ran at cannot
+# support that sentence: identical traces mean different things at different
+# bindings.
+# --------------------------------------------------------------------------- #
+
+def test_identity_has_the_agreed_shape():
+    from agent import loop
+
+    assert loop.identity_of("sales", 1) == {
+        "role": "sales", "org_id": 1, "bound_at": "loop_construction",
+    }
+
+
+def test_loop_reports_the_binding_it_actually_used(monkeypatch):
+    """run_qualification returns the identity it bound, not the default.
+
+    Stubs the Anthropic call so this stays a unit test: the loop's job here is
+    to report its binding truthfully, which needs no live model.
+    """
+    from agent import loop
+
+    class _Resp:
+        stop_reason = "end_turn"
+        content = [type("T", (), {"type": "text", "text": '{"proposed_action":'
+                                  '"nurture","confidence":"low","rationale":"x"}'})()]
+
+    class _Msgs:
+        def create(self, **kw):
+            return _Resp()
+
+    class _Anthropic:
+        def __init__(self, *a, **k):
+            self.messages = _Msgs()
+
+    monkeypatch.setattr(loop, "Anthropic", _Anthropic)
+    run = asyncio.run(loop.run_qualification("x@y.com", role="ops", org_id=7))
+    assert run["identity"] == {
+        "role": "ops", "org_id": 7, "bound_at": "loop_construction",
+    }
+
+
+def _fake_run(role: str, org_id: int):
+    """A minimal run_qualification result: enough for the writers, no LLM."""
+    async def fake(email, *, role=role, org_id=org_id):
+        return {
+            "email": email,
+            "model": "stub-model",
+            "identity": {"role": role, "org_id": org_id,
+                         "bound_at": "loop_construction"},
+            "iterations": [],
+            "final": {"index": 1, "intent": "", "stop_reason": "end_turn",
+                      "proposal": {}},
+            "proposal": {"proposed_action": "nurture", "confidence": "low",
+                         "rationale": "stub"},
+            "stop_reason": "end_turn",
+            "tool_calls": 0,
+            "halted": None,
+        }
+
+    return fake
+
+
+def _new_processing_row(org_id: int) -> int:
+    from psycopg.types.json import Json
+
+    from db import execute
+
+    return execute(
+        "INSERT INTO decisions (org_id, trigger_input, proposed_action, "
+        "reasoning, status) VALUES (%s, %s, '(processing)', %s, 'processing') "
+        "RETURNING id",
+        (org_id, Json({"email": "stub@test.invalid"}), Json({})),
+    )[0]["id"]
+
+
+def _run_worker(main, decision_id, email, org_id, role):
+    """Drive the API's worker endpoint the way a Cloud Task would.
+
+    require_cloud_task short-circuits under emulation (no queue configured in
+    tests), so this exercises the real handler without needing GCP.
+    """
+    return main.internal_process(
+        main.ProcessRequest(decision_id=decision_id, email=email, org_id=org_id,
+                            role=role),
+        claims={"emulated": True},
+        x_cloudtasks_taskretrycount=None,
+    )
+
+
+def _reasoning_of(decision_id: int) -> dict:
+    from db import query as real_query
+
+    return real_query(
+        "SELECT reasoning FROM decisions WHERE id = %s", (decision_id,)
+    )[0]["reasoning"]
+
+
+@needs_db
+def test_api_worker_persists_identity_into_the_row(monkeypatch):
+    """Drive the real background worker and read the row back.
+
+    Asserting on the stored JSON, not on the module source: an earlier version
+    of this test grepped api/main.py for the string "identity" and passed even
+    with the write deleted, because the word still appeared elsewhere in the
+    file. Only the row proves the row.
+    """
+    from agent import loop
+    from api import main
+
+    monkeypatch.setattr(loop, "run_qualification", _fake_run("sales", 1))
+    decision_id = _new_processing_row(1)
+    try:
+        _run_worker(main, decision_id, "stub@test.invalid", 1, "sales")
+        identity = _reasoning_of(decision_id).get("identity")
+        assert identity == {"role": "sales", "org_id": 1,
+                            "bound_at": "loop_construction"}
+    finally:
+        from db import execute
+
+        execute("DELETE FROM decisions WHERE id = %s", (decision_id,))
+
+
+@needs_db
+def test_api_worker_records_identity_even_when_the_run_fails(monkeypatch):
+    """A crashed run still ran at a definite privilege — record it."""
+    from agent import loop
+    from api import main
+
+    async def boom(email, *, role, org_id):
+        raise RuntimeError("model exploded")
+
+    monkeypatch.setattr(loop, "run_qualification", boom)
+    decision_id = _new_processing_row(1)
+    try:
+        _run_worker(main, decision_id, "stub@test.invalid", 1, "sales")
+        reasoning = _reasoning_of(decision_id)
+        assert "error" in reasoning
+        assert reasoning["identity"]["role"] == "sales"
+    finally:
+        from db import execute
+
+        execute("DELETE FROM decisions WHERE id = %s", (decision_id,))
+
+
+@needs_db
+def test_cli_persists_identity_and_files_the_row_under_the_bound_org(monkeypatch):
+    """The CLI writer agrees on shape, and org_id follows the binding.
+
+    cmd_qualify used to hardcode org_id=1 on its own INSERT. It now binds
+    CLI_ORG_ID and hands off to decisions.process, so rebinding the CLI to org 2
+    must move the whole row — not just the audit blob — to org 2.
+    """
+    import argparse
+
+    from agent import cli, loop
+    from db import execute, query as real_query
+
+    monkeypatch.setenv("ANTHROPIC_API_KEY", "stub-key-not-used")
+    monkeypatch.setattr(cli, "CLI_ORG_ID", 2)   # rebind the caller
+    monkeypatch.setattr(loop, "run_qualification", _fake_run("sales", 2))
+
+    before = {r["id"] for r in real_query("SELECT id FROM decisions")}
+    rc = cli.cmd_qualify(argparse.Namespace(email="stub@test.invalid"))
+    after = real_query("SELECT id, org_id, reasoning FROM decisions")
+    new = [r for r in after if r["id"] not in before]
+    try:
+        assert rc == 0 and len(new) == 1
+        row = new[0]
+        assert row["reasoning"]["identity"] == {
+            "role": "sales", "org_id": 2, "bound_at": "loop_construction",
+        }
+        assert row["org_id"] == 2, (
+            "decisions.org_id must come from the binding, not a hardcoded 1"
+        )
+    finally:
+        for r in new:
+            execute("DELETE FROM decisions WHERE id = %s", (r["id"],))
+
+
+@needs_db
+def test_the_audit_question_is_answerable_from_the_row_alone(monkeypatch):
+    """The actual requirement, as a query.
+
+    "The agent ran at role=sales so it could not see the postmortems" must be
+    answerable in SQL against decisions, with no logs and no re-run.
+    """
+    from agent import loop
+    from api import main
+    from db import execute, query as real_query
+
+    monkeypatch.setattr(loop, "run_qualification", _fake_run("sales", 1))
+    decision_id = _new_processing_row(1)
+    try:
+        _run_worker(main, decision_id, "stub@test.invalid", 1, "sales")
+        row = real_query(
+            "SELECT id, org_id, "
+            "       reasoning->'identity'->>'role'     AS role, "
+            "       reasoning->'identity'->>'org_id'   AS ran_org, "
+            "       reasoning->'identity'->>'bound_at' AS bound_at "
+            "FROM decisions WHERE id = %s",
+            (decision_id,),
+        )[0]
+        assert row["role"] == "sales"
+        assert row["ran_org"] == "1"
+        assert row["bound_at"] == "loop_construction"
+        assert row["org_id"] == 1
+    finally:
+        execute("DELETE FROM decisions WHERE id = %s", (decision_id,))
+
+
+# --- The role hole must not reappear as a request field --------------------- #
+
+def test_trigger_request_has_no_role_field():
+    """The whole point of item 2: no request body may carry a privilege."""
+    from api.main import TriggerRequest
+
+    assert "role" not in TriggerRequest.model_fields
+    assert "org_id" not in TriggerRequest.model_fields, (
+        "org_id is the credential's now — there must be no field to assert it"
+    )
+    assert set(TriggerRequest.model_fields) == {"email"}
+
+
+@pytest.mark.parametrize("model_name", ["TriggerRequest", "DecideRequest"])
+def test_request_bodies_reject_a_supplied_role(model_name):
+    """A caller sending role must FAIL, not be quietly ignored.
+
+    Silently dropping it is safe but mute, and mute is how someone concludes the
+    field is honored and wires it up for real later. 422 says no out loud.
+    """
+    import pydantic
+
+    from api import main
+
+    model = getattr(main, model_name)
+    payload = {"email": "x@y.com"} if model_name == "TriggerRequest" \
+        else {"decided_by": "someone"}
+    model(**payload)  # the legitimate body still parses
+
+    with pytest.raises(pydantic.ValidationError, match="[Ee]xtra"):
+        model(**payload, role="admin")
+
+
+def test_api_binds_role_from_the_credential_not_the_request():
+    """Role reaches the gateway from the principal, never from the request body.
+
+    The constant this used to check is gone; the invariant it protected is not.
+    Whatever the API binds must come from the authenticated caller, and `req`
+    must not be involved in deciding it.
+    """
+    import inspect
+
+    from api import main
+
+    src = inspect.getsource(main.trigger)
+    assert "principal.role" in src, "the call site must bind the credential's role"
+    assert "principal.org_id" in src, "and the credential's org"
+    assert "req.role" not in src and "req.org_id" not in src, (
+        "identity must not be read off the request body"
+    )

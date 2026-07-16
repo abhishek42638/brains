@@ -1,0 +1,44 @@
+# Keep secrets and local state out of the build context and the image.
+
+# SECRETS — the important one. config.py's load_dotenv() would happily read a
+# baked-in .env, and load_dotenv(override=False) means it would only apply where
+# a real env var was MISSING — i.e. it would silently fill gaps in production
+# config from a file someone forgot to exclude. Deployments pass real env vars.
+.env
+.env.*
+*.pem
+*.key
+
+# Local virtualenv: built for the host's platform and Python. Copying it in
+# would shadow the venv the builder stage creates.
+.venv/
+venv/
+
+# VCS and CI
+.git/
+.github/
+.gitignore
+
+# Caches and build artifacts
+__pycache__/
+*.py[cod]
+*.egg-info/
+.pytest_cache/
+.ruff_cache/
+.mypy_cache/
+htmlcov/
+.coverage
+
+# Local tooling / editor state
+.claude/
+.vscode/
+.idea/
+.DS_Store
+
+# Not needed at runtime: tests and their fixtures, and the compose file that
+# describes the LOCAL stack.
+tests/
+docker-compose.yml
+
+# docs/knowledge IS needed — ingest.py reads it — so docs/ is deliberately not
+# excluded here.

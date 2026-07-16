@@ -61,6 +61,14 @@ ALLOWED_ACTIONS = ("route_to_sales", "nurture", "discard")
 AGENT_ROLE = "sales"
 AGENT_ORG_ID = 1
 
+# Where in the stack the identity was fixed. Recorded in the audit trail so a
+# reader of a stored decision knows the privilege was decided by CALLER CODE
+# before the model ran — not negotiated mid-run, and not derived from anything
+# the model emitted. If a future transport binds identity somewhere else (e.g.
+# authenticated middleware), that path records its own value here and old rows
+# keep telling the truth about how THEY were bound.
+BOUND_AT = "loop_construction"
+
 SYSTEM_PROMPT = f"""\
 You are a lead-qualification analyst. Your job is to GATHER EVIDENCE and PROPOSE
 an action. You do not execute anything and you must not assume your proposal is
@@ -97,6 +105,16 @@ ones, discard for clearly unqualified/spam. The final disposition is decided by
 code, not by you — just give your honest proposal."""
 
 TASK_TEMPLATE = "Qualify this lead and propose an action: {email}"
+
+
+def identity_of(role: str, org_id: int) -> dict:
+    """The audit record of a binding. One constructor so every writer agrees.
+
+    Both callers (agent/cli.py and api/main.py) persist this verbatim into
+    decisions.reasoning->'identity', including on the error path — a run that
+    crashed still ran at a definite privilege, and that is worth knowing.
+    """
+    return {"role": role, "org_id": org_id, "bound_at": BOUND_AT}
 
 
 def _extract_intent(content) -> str:
@@ -157,8 +175,11 @@ async def run_qualification(
     {
       "email": str,
       "model": str,
-      "role": str,           # the bound identity this run actually ran at
-      "org_id": int,
+      "identity": {          # the binding this run's evidence was gathered under
+        "role": str,         # privilege the tools actually ran at
+        "org_id": int,       # tenant the tools actually ran against
+        "bound_at": str,     # where it was fixed (BOUND_AT)
+      },
       "iterations": [ {index, intent, tool, args, result, is_error,
                        model_latency_ms, tool_latency_ms}, ... ],
       "final": { "index", "intent", "stop_reason", "proposal" },
@@ -167,18 +188,47 @@ async def run_qualification(
       "tool_calls": int,
       "halted": <None | "max_iterations" | "tool_call_cap">,
     }
+
+    Raises whatever the underlying call raised (e.g. anthropic.APIError),
+    with `.partial_trace` and `.identity` attached so the recorder can file a
+    reviewable row instead of losing the run.
     """
     trace: list[dict] = []
-    final: dict | None = None
-    stop_reason = None
-    tool_calls = 0
-    halted = None
 
     # Bind identity ONCE, here, in caller code. The gateway this returns is
     # pinned to (role, org_id) for its lifetime; nothing the model emits during
     # the loop below can alter it.
     bound_mcp = build_mcp(role=role, org_id=org_id)
     logger.info("tool gateway bound to role=%r org_id=%s", role, org_id)
+
+    identity = identity_of(role, org_id)
+
+    try:
+        return await _drive(email, bound_mcp, identity, trace)
+    except Exception as e:
+        # Anything that kills the loop (API error, network, a bad tool call)
+        # takes the trace with it unless we hand it out here. The recorder needs
+        # it: a run that died after three tool calls is a very different thing to
+        # review than one that died immediately, and "we lost it" is exactly the
+        # silent break this system exists to prevent. Attributes on the ORIGINAL
+        # exception, re-raised unchanged, so callers that match on the real
+        # exception type (anthropic.APIError, etc.) still work.
+        e.partial_trace = trace
+        e.identity = identity
+        logger.exception(
+            "qualification loop failed after %d recorded iteration(s); "
+            "partial trace attached", len(trace),
+        )
+        raise
+
+
+async def _drive(email: str, bound_mcp, identity: dict, trace: list[dict]) -> dict:
+    """The loop proper. `trace` is passed in (not owned) so a caller can still
+    read what was gathered when this raises partway through."""
+    final: dict | None = None
+    stop_reason = None
+    tool_calls = 0
+    halted = None
 
     async with Client(bound_mcp) as mcp_client:
         raw_tools = await mcp_client.list_tools()
@@ -301,8 +351,11 @@ async def run_qualification(
     return {
         "email": email,
         "model": MODEL,
-        "role": role,        # audit: the privilege this run was bound to
-        "org_id": org_id,
+        # Audit: the privilege/tenant this run's evidence was gathered under.
+        # This is EVIDENCE, not metadata — "the agent ran at role=sales, so it
+        # could not have seen the postmortems" is a claim a reader must be able
+        # to check from the stored record without re-running anything.
+        "identity": identity,
         "iterations": trace,
         "final": final,
         "proposal": final["proposal"],

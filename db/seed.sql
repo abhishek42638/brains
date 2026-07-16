@@ -43,6 +43,20 @@ INSERT INTO tickets (org_id, company_id, subject, status) VALUES
 INSERT INTO companies (org_id, name, industry, employee_count, annual_revenue_usd, country) VALUES
 (2, 'Acme Robotics', 'Manufacturing', 1200, 250000000, 'US');  -- id 6: same name as id 1, org 2
 
+-- Deliberately a DIFFERENT person behind the same address, with a different
+-- title and source, so a cross-tenant read is visible in the payload rather
+-- than looking like a duplicate of org 1's Priya.
 INSERT INTO leads (org_id, email, first_name, last_name, title, company_id, source) VALUES
-(2, 'priya@acmerobotics.com', 'Priya', 'Sharma', 'VP of Operations',
-    (SELECT id FROM companies WHERE org_id = 2 AND name = 'Acme Robotics'), 'webinar');
+(2, 'priya@acmerobotics.com', 'Priyanka', 'Rao', 'Head of Data',
+    (SELECT id FROM companies WHERE org_id = 2 AND name = 'Acme Robotics'), 'referral');
+
+-- org 2's Acme has its OWN CRM history, disjoint from org 1's Acme. Without
+-- these rows a leak and a correct scope look the same (both "no deals"), so the
+-- cross-tenant tests would pass whether or not the filter worked.
+INSERT INTO deals (org_id, company_id, name, stage, amount_usd, closed_at) VALUES
+(2, (SELECT id FROM companies WHERE org_id = 2 AND name = 'Acme Robotics'),
+    'ORG2-CONFIDENTIAL Acme renewal', 'lost', 990000, '2026-01-05');
+
+INSERT INTO tickets (org_id, company_id, subject, status) VALUES
+(2, (SELECT id FROM companies WHERE org_id = 2 AND name = 'Acme Robotics'),
+    'ORG2-CONFIDENTIAL data migration escalation', 'open');
