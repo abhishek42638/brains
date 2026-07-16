@@ -1,0 +1,20 @@
+services:
+  db:
+    image: pgvector/pgvector:pg16
+    container_name: brains-db
+    environment:
+      POSTGRES_USER: brains
+      POSTGRES_PASSWORD: brains_dev
+      POSTGRES_DB: brains
+    ports:
+      - "5432:5432"
+    volumes:
+      - brains_pgdata:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U brains -d brains"]
+      interval: 5s
+      timeout: 5s
+      retries: 10
+
+volumes:
+  brains_pgdata:
