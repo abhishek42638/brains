@@ -914,15 +914,51 @@ def test_the_audit_question_is_answerable_from_the_row_alone(monkeypatch):
 
 # --- The role hole must not reappear as a request field --------------------- #
 
+#: Everything a caller is allowed to say on a trigger. INTENT ONLY — which lead,
+#: and what they told us about themselves. Widened in phase 6 for external lead
+#: ingestion; `email` alone was the phase 5 set.
+#:
+#: Pinned as an explicit allowlist rather than left open, because the assertion
+#: below is the thing standing between "we widened intent" and "someone added an
+#: identity field and the suite stayed green". A new field here must be a
+#: deliberate edit to this list, made by someone who has read what follows it.
+TRIGGER_INTENT_FIELDS = {
+    "email", "full_name", "title", "company_name", "company_domain",
+    "source", "message",
+}
+
+#: Names that assert WHO the caller is rather than WHAT they want. None of these
+#: may ever be a request field: identity comes from the API key and is closed
+#: over in build_mcp before the model runs.
+IDENTITY_FIELDS = {"role", "org_id", "api_key_id", "permitted_roles", "tenant",
+                   "tenant_id", "principal"}
+
+
 def test_trigger_request_has_no_role_field():
-    """The whole point of item 2: no request body may carry a privilege."""
+    """The whole point of item 2: no request body may carry a privilege.
+
+    Phase 6 widened this body a lot — an external system now hands us a whole
+    lead, and every one of those fields is untrusted text. That widening is
+    about INTENT, and the guarantee it must not touch is that identity is still
+    unsayable. A caller may describe the lead in as much detail as they like;
+    they may not describe themselves.
+    """
     from api.main import TriggerRequest
 
-    assert "role" not in TriggerRequest.model_fields
-    assert "org_id" not in TriggerRequest.model_fields, (
-        "org_id is the credential's now — there must be no field to assert it"
+    fields = set(TriggerRequest.model_fields)
+
+    leaked = fields & IDENTITY_FIELDS
+    assert not leaked, (
+        f"TriggerRequest grew identity field(s) {leaked} — org_id and role come "
+        "from the credential, and a body field to assert them is the exact hole "
+        "phase 5 closed"
     )
-    assert set(TriggerRequest.model_fields) == {"email"}
+    assert fields == TRIGGER_INTENT_FIELDS, (
+        f"TriggerRequest fields changed to {sorted(fields)}. If that was "
+        "deliberate, update TRIGGER_INTENT_FIELDS — but check first that the "
+        "new field is intent (what the caller wants) and not identity (who the "
+        "caller is)."
+    )
 
 
 @pytest.mark.parametrize("model_name", ["TriggerRequest", "DecideRequest"])

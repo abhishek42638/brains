@@ -10,6 +10,10 @@ dependencies = [
     "fastmcp>=3.4.4",
     "google-auth>=2.56.0",
     "google-cloud-tasks>=2.23.0",
+    # Outbound webhook delivery. Present transitively via anthropic and the
+    # Starlette TestClient, but declared here because this code imports it
+    # directly — an undeclared dependency is one `uv lock` away from vanishing.
+    "httpx>=0.28.1",
     "psycopg[binary]>=3.3.4",
     "python-dotenv>=1.2.2",
     "uvicorn>=0.51.0",

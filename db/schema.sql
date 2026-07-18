@@ -49,6 +49,23 @@ CREATE TABLE IF NOT EXISTS companies (
     UNIQUE (org_id, name)
 );
 
+-- Phase 6 (ingestion): external systems hand us a company by DOMAIN more often
+-- than by name — "Acme Corp", "Acme Corporation" and "ACME" are one company and
+-- three names, but one domain. Added as an ALTER rather than a column in the
+-- CREATE above because this file is applied to databases that already exist:
+-- CREATE TABLE IF NOT EXISTS is a no-op on them, so a new column in the body
+-- would silently never appear. IF NOT EXISTS on both keeps the file idempotent.
+ALTER TABLE companies ADD COLUMN IF NOT EXISTS domain TEXT;
+
+-- Partial UNIQUE, not a plain one: domain is nullable (every seeded company has
+-- a name and no domain), and Postgres treats NULLs as distinct in a UNIQUE
+-- constraint, so a plain UNIQUE (org_id, domain) would permit unlimited
+-- NULL-domain rows — true, but it would also index them for nothing. The WHERE
+-- keeps the index to rows that actually have a domain, which is what the
+-- ingestion lookup matches on.
+CREATE UNIQUE INDEX IF NOT EXISTS companies_org_domain_idx
+    ON companies (org_id, domain) WHERE domain IS NOT NULL;
+
 CREATE TABLE IF NOT EXISTS leads (
     id SERIAL PRIMARY KEY,
     org_id INT NOT NULL DEFAULT 1,
@@ -134,3 +151,59 @@ CREATE INDEX IF NOT EXISTS knowledge_chunks_roles_idx
     ON knowledge_chunks USING gin (permitted_roles);
 CREATE INDEX IF NOT EXISTS knowledge_chunks_org_doc_idx
     ON knowledge_chunks (org_id, doc_name);
+
+-- Phase 6 (outbound events): where a decision goes after it is made.
+--
+-- An org registers a URL and the events it wants; every matching decision
+-- transition enqueues one delivery per endpoint. org_id is on the table and in
+-- every WHERE, so an org can only ever manage — and only ever receive — its own.
+--
+-- `secret` is the HMAC key the receiver verifies with, so unlike an API key it
+-- must be stored in a form we can still compute with; it is a SHARED secret, not
+-- a credential we check. It is returned ONCE at creation and never again, and
+-- the CRUD responses omit it, so it does not leak through a list call.
+--
+-- `events` is TEXT[] rather than a join table: the set is small, closed, and
+-- read on every transition. '*' subscribes to all of them.
+CREATE TABLE IF NOT EXISTS webhook_endpoints (
+    id SERIAL PRIMARY KEY,
+    org_id INT NOT NULL,
+    url TEXT NOT NULL,
+    secret TEXT NOT NULL,
+    events TEXT[] NOT NULL,
+    active BOOLEAN NOT NULL DEFAULT TRUE,
+    created_at TIMESTAMPTZ NOT NULL DEFAULT now()
+);
+CREATE INDEX IF NOT EXISTS webhook_endpoints_org_active_idx
+    ON webhook_endpoints (org_id, active);
+
+-- Phase 6: did the webhook fire? A query, not a guess.
+--
+-- One row per (delivery attempt sequence), created BEFORE the POST is attempted,
+-- so a delivery that dies mid-flight still left a record that it was owed. The
+-- terminal states are 'delivered' and 'failed'; 'pending' means a task is still
+-- carrying it. `attempts` counts tries, `status_code` and `error` record the
+-- last outcome — a receiver returning 500 four times is a different story from
+-- one whose DNS never resolved, and both are worth being able to read back.
+--
+-- ON DELETE CASCADE: deleting an endpoint takes its delivery history with it.
+-- The alternative (orphan rows pointing at a dead endpoint id) makes the history
+-- unreadable, and the decision record itself is the durable audit trail.
+CREATE TABLE IF NOT EXISTS webhook_deliveries (
+    id SERIAL PRIMARY KEY,
+    org_id INT NOT NULL,
+    endpoint_id INT NOT NULL REFERENCES webhook_endpoints(id) ON DELETE CASCADE,
+    decision_id INT REFERENCES decisions(id) ON DELETE SET NULL,
+    event TEXT NOT NULL,
+    delivery_uuid TEXT NOT NULL UNIQUE,   -- X-Brains-Delivery; receiver dedupe key
+    status TEXT NOT NULL DEFAULT 'pending',  -- 'pending'|'delivered'|'failed'
+    attempts INT NOT NULL DEFAULT 0,
+    status_code INT,
+    error TEXT,
+    created_at TIMESTAMPTZ NOT NULL DEFAULT now(),
+    delivered_at TIMESTAMPTZ
+);
+CREATE INDEX IF NOT EXISTS webhook_deliveries_org_idx
+    ON webhook_deliveries (org_id, created_at DESC);
+CREATE INDEX IF NOT EXISTS webhook_deliveries_decision_idx
+    ON webhook_deliveries (decision_id);

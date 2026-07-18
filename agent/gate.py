@@ -13,7 +13,7 @@ Phase 4 will move CONFIG into the DB as admin-editable settings; for now the
 thresholds live here, in one place, not scattered through the code.
 """
 
-from db import execute
+from db import execute, query
 
 # --- Human-configured thresholds (Phase 4 makes these admin-editable) --------
 CONFIG = {
@@ -165,4 +165,50 @@ def _transition(
                 "(already decided, or does not exist)"
             ),
         }
+
+    # Outbound event, emitted here rather than in the API handler because this
+    # is the ONE place both doors converge: `api/main.py` approves over HTTP and
+    # `agent/cli.py` approves from a terminal, and a webhook that only fired for
+    # one of them would be a subscription that lies about how it works.
+    #
+    # Only on the winning path — `rows` empty means another approval got there
+    # first, and that caller already emitted. Exactly one event per transition.
+    _emit_transition(decision_id, new_status, org_id)
+
     return {"ok": True, "id": rows[0]["id"], "status": new_status}
+
+
+def _emit_transition(decision_id: int, new_status: str,
+                     org_id: int | None) -> None:
+    """Fire the outbound webhook for an approve/reject. Never raises.
+
+    The decision is committed before this runs. A registered endpoint being
+    unreachable, misconfigured or hostile is not a reason to fail a human's
+    approval, so every failure is swallowed and logged.
+
+    The CLI path passes org_id=None (no tenant scoping on that door), so the org
+    is read back from the row — the event still has to be delivered to exactly
+    one tenant's endpoints, and guessing 1 would cross-post another org's
+    decision to whoever happened to be org 1.
+    """
+    try:
+        import webhooks
+
+        target_org = org_id
+        if target_org is None:
+            rows = query(
+                "SELECT org_id FROM decisions WHERE id = %s", (decision_id,)
+            )
+            if not rows:
+                return
+            target_org = rows[0]["org_id"]
+
+        webhooks.emit_for_status(new_status, decision_id=decision_id,
+                                 org_id=target_org)
+    except Exception:  # noqa: BLE001 — a webhook must not undo an approval
+        import logging
+
+        logging.getLogger("brains-gate").exception(
+            "webhook emission failed for decision %s (%s); the transition "
+            "itself stands", decision_id, new_status,
+        )

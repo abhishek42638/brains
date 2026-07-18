@@ -221,13 +221,64 @@ def _run_in_thread(payload: dict) -> None:
                 payload["decision_id"])
 
 
-def _create_cloud_task(payload: dict) -> str:
+# --- Outbound webhook delivery -----------------------------------------------
+#
+# Same queue, same OIDC signer, same retry policy as /internal/process. A second
+# queue would let webhook retries be tuned separately, which is a real argument
+# once one noisy receiver can starve the agent loop of dispatch slots — but it is
+# a second queue, a second set of variables in deploy.sh and a second thing to
+# keep in sync, for a workload of a few deliveries per decision. One queue now;
+# the split is a variable block away if delivery volume ever justifies it.
+
+def enqueue_delivery(delivery_id: int, *, org_id: int) -> str:
+    """Dispatch ONE webhook delivery. Returns how it was dispatched.
+
+    The payload is deliberately just the delivery id, not the event body. The
+    body is rebuilt from the database inside the handler, so a task sitting in
+    the queue is not a copy of a decision record waiting to go stale, and the
+    task itself carries nothing a queue reader would care about.
+    """
+    payload = {"delivery_id": delivery_id, "org_id": org_id}
+
+    if emulated():
+        _deliver_in_thread(payload)
+        return "in-process"
+
+    return _create_cloud_task(payload, path="/internal/deliver",
+                              label=f"delivery {delivery_id}")
+
+
+def _deliver_in_thread(payload: dict) -> None:
+    """Local path: POST off-thread so the caller is not held by a receiver."""
+    import webhooks
+
+    def run():
+        try:
+            webhooks.deliver(payload["delivery_id"], attempt=0,
+                             is_final_attempt=True)
+        except BaseException:  # noqa: BLE001 — a thread dying silently is the bug
+            logger.exception("in-process delivery failed for delivery %s",
+                             payload["delivery_id"])
+
+    threading.Thread(target=run, daemon=True,
+                     name=f"deliver-{payload['delivery_id']}").start()
+    logger.info("delivery %s dispatched in-process", payload["delivery_id"])
+
+
+def _create_cloud_task(payload: dict, *, path: str = "/internal/process",
+                       label: str | None = None) -> str:
     """Cloud path: enqueue an HTTP task carrying an OIDC token.
 
     Verified against docs.cloud.google.com/tasks/docs/samples/
     cloud-tasks-create-http-task-with-token (google-cloud-tasks 2.23.0): the
     surface is typed objects (Task/HttpRequest/OidcToken) wrapped in a
     CreateTaskRequest, not dicts.
+
+    `path` is a parameter because both internal handlers — the agent loop and
+    webhook delivery — want the identical task shape and differ only in where
+    they land. The AUDIENCE deliberately does not vary with the path: it stays
+    the service base URL, computed by `process_audience()` in the one place, so
+    the signer and the verifier cannot drift apart per-endpoint.
     """
     from google.cloud import tasks_v2
 
@@ -237,7 +288,7 @@ def _create_cloud_task(payload: dict) -> str:
     task = tasks_v2.Task(
         http_request=tasks_v2.HttpRequest(
             http_method=tasks_v2.HttpMethod.POST,
-            url=f"{SERVICE_URL}/internal/process",
+            url=f"{SERVICE_URL}{path}",
             headers={"Content-Type": "application/json"},
             body=json.dumps(payload).encode(),
             oidc_token=tasks_v2.OidcToken(
@@ -249,5 +300,6 @@ def _create_cloud_task(payload: dict) -> str:
     created = client.create_task(
         tasks_v2.CreateTaskRequest(parent=parent, task=task)
     )
-    logger.info("decision %s enqueued as %s", payload["decision_id"], created.name)
+    logger.info("%s enqueued as %s",
+                label or f"decision {payload.get('decision_id')}", created.name)
     return created.name

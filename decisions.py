@@ -81,6 +81,28 @@ HUMAN_QUEUE_STATUSES = ("pending_approval", STATUS_NEEDS_REVIEW)
 NO_ACTION = "(none)"
 
 
+def _emit(status: str, *, decision_id: int, org_id: int) -> None:
+    """Announce a completed transition to the org's webhook endpoints.
+
+    Called ONLY after an UPDATE that returned a row, so an event always
+    corresponds to a transition that really happened.
+
+    Belt AND braces on failure: `webhooks.emit` already swallows everything, and
+    this wraps it again. The second layer is not redundancy for its own sake —
+    it also covers the import itself failing, and it states the invariant at the
+    call site, where the next person editing this module will read it: the
+    decision is committed by the time we get here, and NOTHING about notifying
+    an integration may change that outcome or fail the caller.
+    """
+    try:
+        import webhooks
+
+        webhooks.emit_for_status(status, decision_id=decision_id, org_id=org_id)
+    except Exception:  # noqa: BLE001 — a decision must not fail over a webhook
+        logger.exception("webhook emission failed for decision %s (%s); the "
+                         "decision itself is unaffected", decision_id, status)
+
+
 def create_processing(*, org_id: int, trigger_input: dict, identity: dict) -> int:
     """Create a decision in 'processing'. Returns its id.
 
@@ -316,7 +338,7 @@ def needs_review(
             "model": run.get("model"),
         })
 
-    execute(
+    rows = execute(
         # Carry `attempts` across rather than overwriting reasoning wholesale.
         # This row may be on its second or third go (begin_retry archives each
         # failure there), and a straight replace would drop the earlier ones —
@@ -327,10 +349,16 @@ def needs_review(
         "      WHEN reasoning ? 'attempts' "
         "      THEN jsonb_build_object('attempts', reasoning->'attempts') "
         "      ELSE '{}'::jsonb END) "
-        "WHERE id=%s AND org_id=%s",
+        # RETURNING so we can tell whether this UPDATE actually matched. Without
+        # it the statement reports a rowcount nobody reads, and the webhook
+        # emission below would fire for a row in another org, or for no row at
+        # all — announcing a transition that never happened.
+        "WHERE id=%s AND org_id=%s RETURNING id",
         (STATUS_NEEDS_REVIEW, NO_ACTION, Json(reasoning), decision_id, org_id),
     )
     logger.warning("decision %s -> %s: %s", decision_id, STATUS_NEEDS_REVIEW, error)
+    if rows:
+        _emit(STATUS_NEEDS_REVIEW, decision_id=decision_id, org_id=org_id)
     return {"id": decision_id, "status": STATUS_NEEDS_REVIEW, "error": error}
 
 
@@ -351,7 +379,7 @@ def _complete(decision_id: int, *, org_id: int, run: dict, facts: dict,
         "gate": gate_result,
     }
     action = run["proposal"]["proposed_action"]
-    execute(
+    rows = execute(
         # org_id is SET from the binding as well as matched in the WHERE: the row
         # is filed under the tenant whose data actually produced the evidence.
         #
@@ -366,11 +394,19 @@ def _complete(decision_id: int, *, org_id: int, run: dict, facts: dict,
         "      WHEN reasoning ? 'attempts' "
         "      THEN jsonb_build_object('attempts', reasoning->'attempts') "
         "      ELSE '{}'::jsonb END) "
-        "WHERE id=%s AND org_id=%s",
+        # RETURNING for the same reason as needs_review: an outbound event must
+        # follow a transition that actually happened, not one we assumed.
+        "WHERE id=%s AND org_id=%s RETURNING id",
         (facts["lead_id"], action, facts["score"], facts["band"],
          facts["rules_version"], gate_result["status"],
          run["identity"]["org_id"], Json(reasoning), decision_id, org_id),
     )
+    if rows:
+        # The row was filed under the RUN's org (see the SET above), so the
+        # event is emitted for that org too — the tenant whose data actually
+        # produced the evidence is the tenant whose endpoints hear about it.
+        _emit(gate_result["status"], decision_id=decision_id,
+              org_id=run["identity"]["org_id"])
     return {
         "id": decision_id,
         "status": gate_result["status"],
