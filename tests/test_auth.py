@@ -204,7 +204,19 @@ def test_the_route_list_has_no_unauthenticated_endpoint():
     from auth import require_cloud_task, require_principal, require_scheduler
 
     doors = {require_principal, require_cloud_task, require_scheduler}
-    exempt = {"/openapi.json", "/docs", "/docs/oauth2-redirect", "/redoc"}
+    # Exempt: routes that serve no tenant data and therefore have nothing for a
+    # credential to scope. Each one is a deliberate decision, not an oversight —
+    # this test exists to force exactly that decision.
+    #
+    # /console is the read-only viewer. The response is static markup with no
+    # org, no decisions and no key in it; every call the PAGE then makes carries
+    # X-API-Key and is authorized by require_principal like anything else. A
+    # credential check in front of the HTML would protect nothing that is not
+    # already protected where the data is. tests/test_console.py holds that
+    # invariant up — if the page ever starts carrying data, that is where it
+    # breaks, and this exemption stops being correct.
+    exempt = {"/openapi.json", "/docs", "/docs/oauth2-redirect", "/redoc",
+              "/console"}
     for route in app.routes:
         dependant = getattr(route, "dependant", None)
         if dependant is None or route.path in exempt:

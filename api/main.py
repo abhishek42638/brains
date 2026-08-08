@@ -26,6 +26,7 @@ Rate limiting is per credential — see auth.TRIGGER_RATE_LIMIT_PER_HOUR.
 """
 
 import logging
+from pathlib import Path
 
 import config  # noqa: F401  — loads .env before anything reads os.environ
 import decisions
@@ -42,7 +43,8 @@ from auth import (
     require_principal,
     require_scheduler,
 )
-from fastapi import Depends, FastAPI, Header, HTTPException
+from fastapi import Depends, FastAPI, Header, HTTPException, Query
+from fastapi.responses import HTMLResponse
 from pydantic import BaseModel, ConfigDict, Field, field_validator
 
 from agent import gate
@@ -201,6 +203,7 @@ class DecisionSummary(BaseModel):
     band: str | None
     status: str
     created_at: str
+    decision_type: str = DEFAULT_DECISION_TYPE
 
 
 class DecisionDetail(DecisionSummary):
@@ -664,6 +667,83 @@ def pending(
     return [_summary(r) for r in rows]
 
 
+# The console page, read once at import rather than per request: it is a static
+# file that cannot change without a redeploy, and re-reading it on every GET
+# would be a filesystem hit on a path that exists to be fast and boring.
+_CONSOLE_HTML = (Path(__file__).parent / "console.html").read_text(encoding="utf-8")
+
+
+@app.get("/console", response_class=HTMLResponse, include_in_schema=False)
+def console() -> HTMLResponse:
+    """The read-only decisions viewer. Static HTML; no data in the page.
+
+    SERVED UNAUTHENTICATED, ON PURPOSE. This response contains no decisions, no
+    org, and no key — it is markup and script. Every call the page then makes
+    carries X-API-Key and is authorized server-side by the same dependency as
+    every other route, so putting a credential check in front of the HTML would
+    protect nothing that is not already protected where it matters.
+
+    The page holds the key in memory only — never localStorage, never
+    sessionStorage, never a URL parameter, the last because a key in a query
+    string ends up in browser history, in Referer headers and in proxy logs.
+
+    READ-ONLY: it renders and does not act. Approve/reject from the console is
+    roadmap item 11.
+    """
+    return HTMLResponse(_CONSOLE_HTML)
+
+
+# How many decisions one list call may return. Capped rather than unbounded
+# because the only thing on the other end is a browser rendering rows, and an
+# org with a year of history would otherwise ask for all of it by accident.
+DECISIONS_PAGE_MAX = 200
+DECISIONS_PAGE_DEFAULT = 50
+
+
+@app.get("/decisions", response_model=list[DecisionSummary])
+def list_decisions(
+    principal: Principal = Depends(require_principal),
+    status: str | None = Query(default=None, max_length=32),
+    decision_type: str | None = Query(default=None, max_length=64),
+    limit: int = Query(default=DECISIONS_PAGE_DEFAULT, ge=1,
+                       le=DECISIONS_PAGE_MAX),
+    offset: int = Query(default=0, ge=0),
+) -> list[DecisionSummary]:
+    """This org's decisions, newest first. The console's list view.
+
+    Scoped to the credential's org, with no parameter that widens it — the
+    filters narrow what you already may see and cannot reach past it.
+
+    Both filters are optional and both are matched as equality against a bound
+    parameter, never interpolated. An unknown `status` or `decision_type` is not
+    an error: it is a filter that matches nothing, which is the honest answer to
+    "show me the decisions of a type you do not have".
+
+    Ordered by id DESC rather than created_at DESC: created_at has a default of
+    now() and rows written in the same transaction can share a timestamp, so id
+    is the only total order here, and a list whose paging can repeat or skip a
+    row under `offset` is worse than one that is merely approximate about time.
+    """
+    clauses = ["org_id = %s"]
+    params: list = [principal.org_id]
+    if status is not None:
+        clauses.append("status = %s")
+        params.append(status)
+    if decision_type is not None:
+        clauses.append("decision_type = %s")
+        params.append(decision_type)
+    params.extend([limit, offset])
+
+    rows = query(
+        "SELECT id, lead_id, proposed_action, score, band, status, created_at, "
+        "       decision_type "
+        f"FROM decisions WHERE {' AND '.join(clauses)} "
+        "ORDER BY id DESC LIMIT %s OFFSET %s",
+        tuple(params),
+    )
+    return [_summary(r) for r in rows]
+
+
 @app.get("/decisions/{decision_id}", response_model=DecisionDetail)
 def get_decision(
     decision_id: int, principal: Principal = Depends(require_principal),
@@ -1082,6 +1162,10 @@ def _summary(r: dict) -> DecisionSummary:
         id=r["id"], lead_id=r["lead_id"], proposed_action=r["proposed_action"],
         score=r["score"], band=r["band"], status=r["status"],
         created_at=r["created_at"].isoformat(),
+        # .get: the pending query selects an explicit column list that predates
+        # this field, and a summary that raised for a caller who did not ask for
+        # it would be a worse trade than defaulting to the only type there is.
+        decision_type=r.get("decision_type") or DEFAULT_DECISION_TYPE,
     )
 
 
