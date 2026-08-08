@@ -11,8 +11,13 @@ INSERT INTO leads (org_id, email, first_name, last_name, title, company_id, sour
 -- score >= 80 with nothing blocking → gate auto-executes. The only clean
 -- auto-route path in the seed.
 (1, 'priya@acmerobotics.com',  'Priya',  'Sharma',  'VP of Operations',  1, 'webinar'),
--- DEMO PATH 4 — DISCARD: score 0 (junior title + tiny co + cold list) → the model
--- proposes discard; below threshold so the gate still routes it to a human.
+-- DEMO PATH 4 — AUTO-DISCARD: score 0 (junior title + tiny co + cold list), and
+-- Karma Textiles has no deals and no tickets, so NO BLOCKER FIRES. 0 <= the
+-- discard floor of 20 and the model agrees the action is 'discard' → the gate
+-- discards it on its own, with no human involved. Autonomy at the bottom end.
+-- Contrast noreply@leadgenblast.co below, which also scores 0 but has no
+-- company: blocker:no_company fires and outranks the floor, so THAT one is the
+-- score-0 lead that reaches a human.
 (1, 'sam@karmatextiles.in',    'Sam',    'Okoro',   'Data Analyst',      3, 'cold_list'),
 -- DEMO PATH 3 — THRESHOLD-GATE: score 65 (Founder + mid co + low rev + form) → warm,
 -- under the 80 auto-execute gate, no blocker → pending_approval on score alone.

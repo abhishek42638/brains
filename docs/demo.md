@@ -4,8 +4,9 @@ Read-and-do. Five beats, in order, roughly six minutes. Every command here is
 literal — paste it, watch the thing happen, move on.
 
 The scores and blockers below were computed from the seed data rather than
-copied from the comments in `db/seed.sql`, one of which is out of date. If you
-change `rules.py` or the seed, re-derive them before recording.
+copied from the comments in `db/seed.sql` — one of which was out of date when
+this was written, and has since been corrected to match. If you change
+`rules.py` or the seed, re-derive them before recording.
 
 ## Before you start
 
