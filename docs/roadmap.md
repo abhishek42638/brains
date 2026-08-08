@@ -78,7 +78,8 @@ buttons driven by the webhooks, calling the existing approve/reject endpoints.
 
 **11. Console maturation.** Key management UI (mint/revoke via
 `auth.create_key`), per-decision-type policy editing, decision detail
-deep-links. *Unlocks:* onboarding an org without touching `psql`.
+deep-links. Promote `policy_source` to an indexed column when the console
+filters on it. *Unlocks:* onboarding an org without touching `psql`.
 
 ## Horizon 3 — Earn the platform claims (months 4–6)
 
