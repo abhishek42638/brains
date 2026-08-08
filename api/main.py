@@ -33,9 +33,11 @@ import ingestion
 import tasks
 import webhooks
 from auth import (
+    TRIGGER_RATE_LIMIT_PER_HOUR,
     Principal,
     RateLimitExceeded,
     charge_trigger,
+    charge_triggers,
     require_cloud_task,
     require_principal,
     require_scheduler,
@@ -123,6 +125,45 @@ class TriggerRequest(StrictRequest):
 class TriggerResponse(BaseModel):
     decision_id: int
     status: str
+
+
+# One full hour's budget in a single call. Tied to the rate limit BY NAME, not
+# by a copied number, because the two are the same quantity: the cap exists so
+# that one batch cannot exceed what one credential may spend in an hour, and a
+# separately-maintained 20 here would silently stop meaning that the first time
+# someone raised the ceiling.
+MAX_BATCH = TRIGGER_RATE_LIMIT_PER_HOUR
+
+
+class BatchTriggerRequest(StrictRequest):
+    """Up to MAX_BATCH leads, each exactly as the single endpoint takes them.
+
+    `leads` reuses TriggerRequest wholesale, so every cap, every `extra=forbid`,
+    and the whole no-identity-in-the-body rule apply per lead without being
+    restated. A batch is N triggers, not a different kind of thing.
+
+    The size bounds are Field constraints so an oversized batch is a 422 from
+    the edge before any of it is read as work — and, more to the point, before
+    the budget is charged.
+    """
+
+    leads: list[TriggerRequest] = Field(min_length=1, max_length=MAX_BATCH)
+
+
+class BatchTriggerResult(BaseModel):
+    """One lead's outcome. `email` echoes the input so results are tie-able."""
+
+    email: str
+    decision_id: int | None
+    status: str
+    detail: str | None = None
+
+
+class BatchTriggerResponse(BaseModel):
+    accepted: int
+    failed: int
+    triggers_used_this_hour: int
+    results: list[BatchTriggerResult]
 
 
 class DecideRequest(StrictRequest):
@@ -333,6 +374,27 @@ def trigger(
     # worker never runs still records the privilege it was created under.
     identity = identity_of(principal.role, principal.org_id)
 
+    decision_id = _ingest_and_dispatch(
+        req, principal=principal, identity=identity, triggers_used=used,
+    )
+    return TriggerResponse(decision_id=decision_id,
+                           status=decisions.STATUS_PROCESSING)
+
+
+def _ingest_and_dispatch(req: TriggerRequest, *, principal: Principal,
+                         identity: dict, triggers_used: int,
+                         batch_size: int | None = None) -> int:
+    """Ingest one lead, file its decision, dispatch the loop. Returns the id.
+
+    Everything `POST /decisions/trigger` does after charging the budget, factored
+    out so the batch endpoint runs each of its leads down the identical path
+    rather than a parallel reimplementation of it. The budget is charged by the
+    CALLER, because that is the one part that differs: one charge of 1 for a
+    single trigger, one charge of N for a batch.
+
+    Raises HTTPException on failure, which the single path lets propagate and
+    the batch path catches per lead.
+    """
     # INGEST FIRST, then decide. The loop's very first tool call is
     # lookup_lead(email), and before this existed a never-seen email returned
     # {"found": false} — no lead row, so no lead_id, so `score_lead` was
@@ -372,7 +434,11 @@ def trigger(
             "source": "api",
             # Audit: which credential asked for this. The key id, never the key.
             "api_key_id": principal.api_key_id,
-            "triggers_used_this_hour": used,
+            "triggers_used_this_hour": triggers_used,
+            # Present only for a batched lead, so the audit trail distinguishes
+            # "one of 12 sent together" from a single call — they charge the
+            # same budget and are otherwise indistinguishable on the row.
+            **({"batch_size": batch_size} if batch_size is not None else {}),
             # What the caller supplied, kept verbatim and separate from what we
             # derived. A hostile title is evidence, so it is recorded rather
             # than scrubbed — the record of what was sent is the thing you want
@@ -404,13 +470,102 @@ def trigger(
         )
         logger.exception("enqueue failed for decision %s; parked in %s",
                          decision_id, decisions.STATUS_NEEDS_REVIEW)
-        raise HTTPException(
+        failure = HTTPException(
             status_code=503,
             detail=f"could not enqueue processing for decision {decision_id}; "
                    f"it has been parked for review rather than lost",
+        )
+        # The row exists and is parked; the batch path reports its id rather
+        # than leaving the caller to discover a needs_review row it cannot tie
+        # back to a lead it sent.
+        failure.decision_id = decision_id
+        raise failure from e
+
+    return decision_id
+
+
+@app.post("/decisions/trigger/batch", response_model=BatchTriggerResponse,
+          status_code=202)
+def trigger_batch(
+    req: BatchTriggerRequest,
+    principal: Principal = Depends(require_principal),
+) -> BatchTriggerResponse:
+    """Trigger up to MAX_BATCH leads in one call. Returns one result per lead.
+
+    THE RATE-LIMIT DECISION, STATED OUTRIGHT: a batch of N charges N against the
+    key's per-hour budget — the same counter a single trigger charges 1 against.
+    There is NO separate batch ceiling. The limit exists to bound what one
+    credential can spend on Anthropic calls, and a batch endpoint with a budget
+    of its own would be a way around that rather than a use of it.
+
+    So the cap here is `MAX_BATCH = TRIGGER_RATE_LIMIT_PER_HOUR` — one full
+    hour's budget in a single call. It is a 422 at the edge (a Field constraint)
+    rather than a 429, because "you may not ask for 500 in one request" is a
+    shape error that is true regardless of budget, while "you have 3 left" is a
+    state error that depends on the hour.
+
+    OVER BUDGET REFUSES THE WHOLE BATCH, having charged nothing — see
+    `auth.charge_triggers`. A partial run is the outcome most worth avoiding:
+    the caller would have to work out which of their leads ran, and re-sending
+    the batch would double-trigger the ones that did.
+
+    AFTER the budget passes, each lead runs the identical path a single trigger
+    runs, and gets its own entry in `results`. A lead that fails to ingest does
+    NOT abort the ones behind it, because aborting is what would force the
+    caller to guess: leads already dispatched would be running with their ids
+    only in an error the caller can't parse. Every lead is therefore accounted
+    for by email, in order, with a decision id or a reason.
+
+    The 202 is the same promise as the single endpoint — accepted, not decided.
+    """
+    from agent.loop import identity_of  # lazy: keep the SDK import off this path
+
+    n = len(req.leads)
+    try:
+        used = charge_triggers(principal.api_key_id, n)
+    except RateLimitExceeded as e:
+        raise HTTPException(
+            status_code=429,
+            detail=f"rate limit exceeded: this batch of {e.requested} would "
+                   f"put this API key at {e.count}/{e.limit} triggers this "
+                   f"hour ({e.used} already used, {e.remaining} remaining). "
+                   f"No lead in it was processed — send {e.remaining} or "
+                   f"fewer, or wait for the next hour.",
+            headers={"Retry-After": "3600"},
         ) from e
 
-    return TriggerResponse(decision_id=decision_id, status=decisions.STATUS_PROCESSING)
+    identity = identity_of(principal.role, principal.org_id)
+
+    # `used` is the count AFTER charging all N, so the k-th lead of the batch
+    # stands at used - n + k + 1. Recording the per-lead figure keeps a batched
+    # row's audit trail readable the same way a single trigger's is.
+    first = used - n
+
+    results: list[BatchTriggerResult] = []
+    for k, lead in enumerate(req.leads):
+        try:
+            decision_id = _ingest_and_dispatch(
+                lead, principal=principal, identity=identity,
+                triggers_used=first + k + 1, batch_size=n,
+            )
+            results.append(BatchTriggerResult(
+                email=lead.email, decision_id=decision_id,
+                status=decisions.STATUS_PROCESSING,
+            ))
+        except HTTPException as e:
+            logger.warning("batch lead %r failed: %s", lead.email, e.detail)
+            results.append(BatchTriggerResult(
+                email=lead.email,
+                decision_id=getattr(e, "decision_id", None),
+                status="failed",
+                detail=str(e.detail),
+            ))
+
+    accepted = sum(1 for r in results if r.status == decisions.STATUS_PROCESSING)
+    return BatchTriggerResponse(
+        accepted=accepted, failed=n - accepted,
+        triggers_used_this_hour=used, results=results,
+    )
 
 
 @app.get("/decisions/pending", response_model=list[DecisionSummary])

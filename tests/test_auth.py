@@ -606,3 +606,224 @@ def test_charge_trigger_rolls_the_window_over(key_factory):
     execute("UPDATE api_key_rate_limit SET window_start = window_start - "
             "interval '2 hours' WHERE api_key_id = %s", (key_id,))
     assert auth.charge_trigger(key_id, limit=3) == 1
+
+
+# --- Batch triggering ------------------------------------------------------- #
+#
+# The rule these pin down: a batch of N charges N against the SAME per-key hourly
+# budget a single trigger charges 1 against. No separate batch ceiling, and an
+# over-budget batch is refused whole — having charged nothing — so the caller
+# never has to work out which of their leads ran.
+
+def _used_this_hour(key_id: int) -> int:
+    rows = query("SELECT count, window_start < date_trunc('hour', now()) AS stale "
+                 "FROM api_key_rate_limit WHERE api_key_id = %s", (key_id,))
+    if not rows or rows[0]["stale"]:
+        return 0
+    return rows[0]["count"]
+
+
+@pytest.fixture
+def batch_client(client, monkeypatch):
+    """A client whose triggers never reach Anthropic, cleaning up its rows."""
+    monkeypatch.setattr(decisions, "process",
+                        lambda *a, **k: {"id": 0, "status": "x"})
+    made = []
+
+    def post(raw, emails):
+        r = client.post("/decisions/trigger/batch", headers={"X-API-Key": raw},
+                        json={"leads": [{"email": e} for e in emails]})
+        if r.status_code == 202:
+            made.extend(x["decision_id"] for x in r.json()["results"]
+                        if x["decision_id"] is not None)
+        return r
+
+    yield post
+    for did in made:
+        execute("DELETE FROM decisions WHERE id = %s", (did,))
+
+
+def test_batch_of_exactly_the_remaining_budget_is_accepted(batch_client,
+                                                           key_factory,
+                                                           monkeypatch):
+    """The exact boundary: N left, N sent. Allowed, and it spends the lot."""
+    monkeypatch.setattr(auth, "TRIGGER_RATE_LIMIT_PER_HOUR", 5)
+    raw, key_id = key_factory()
+
+    r = batch_client(raw, [f"boundary{i}@test.invalid" for i in range(5)])
+
+    assert r.status_code == 202, r.text
+    body = r.json()
+    assert body["accepted"] == 5, body
+    assert body["failed"] == 0
+    assert body["triggers_used_this_hour"] == 5
+    assert len(body["results"]) == 5
+    assert all(x["status"] == "processing" for x in body["results"])
+    assert _used_this_hour(key_id) == 5
+
+    # Exactly at the ceiling means the NEXT one is refused — the boundary is
+    # inclusive, not off by one in either direction.
+    over = batch_client(raw, ["one-too-many@test.invalid"])
+    assert over.status_code == 429, over.text
+
+
+def test_over_budget_batch_is_rejected_atomically(batch_client, key_factory,
+                                                  monkeypatch):
+    """Refused whole: no decision rows, and NOTHING charged against the key."""
+    monkeypatch.setattr(auth, "TRIGGER_RATE_LIMIT_PER_HOUR", 5)
+    raw, key_id = key_factory()
+
+    assert batch_client(raw, ["a@atomic.invalid",
+                              "b@atomic.invalid"]).status_code == 202
+    assert _used_this_hour(key_id) == 2
+
+    before = query("SELECT count(*) AS n FROM decisions")[0]["n"]
+    r = batch_client(raw, [f"over{i}@atomic.invalid" for i in range(4)])
+
+    assert r.status_code == 429, r.text
+    assert r.headers.get("Retry-After") == "3600"
+    detail = r.json()["detail"]
+    assert "4" in detail and "3 remaining" in detail, detail
+
+    assert query("SELECT count(*) AS n FROM decisions")[0]["n"] == before, (
+        "a refused batch created decision rows"
+    )
+    # The charge is the part most easily got wrong: a loop of single charges
+    # would have spent 3 of the 4 before hitting the ceiling, leaving the key
+    # exhausted by a batch that never ran.
+    assert _used_this_hour(key_id) == 2, (
+        "a refused batch spent budget anyway"
+    )
+    # Proof the budget really is intact: the 3 that were left still work.
+    assert batch_client(raw, [f"after{i}@atomic.invalid"
+                              for i in range(3)]).status_code == 202
+
+
+def test_batch_and_singles_share_one_budget(batch_client, client, key_factory,
+                                            monkeypatch):
+    """One counter. A batch cannot be a way around what singles are limited to."""
+    monkeypatch.setattr(auth, "TRIGGER_RATE_LIMIT_PER_HOUR", 6)
+    raw, key_id = key_factory()
+    singles = []
+
+    def single(email):
+        r = client.post("/decisions/trigger", headers={"X-API-Key": raw},
+                        json={"email": email})
+        if r.status_code == 202:
+            singles.append(r.json()["decision_id"])
+        return r
+
+    try:
+        assert single("s1@shared.invalid").status_code == 202
+        assert _used_this_hour(key_id) == 1
+
+        assert batch_client(raw, [f"b{i}@shared.invalid"
+                                  for i in range(4)]).status_code == 202
+        assert _used_this_hour(key_id) == 5, "the batch charged 4, not 1"
+
+        assert single("s2@shared.invalid").status_code == 202
+        assert _used_this_hour(key_id) == 6
+
+        # Budget spent. BOTH doors are now shut — the batch endpoint is not a
+        # second allowance, which is the whole reason it charges N.
+        assert single("s3@shared.invalid").status_code == 429
+        assert batch_client(raw, ["b5@shared.invalid"]).status_code == 429
+    finally:
+        for did in singles:
+            execute("DELETE FROM decisions WHERE id = %s", (did,))
+
+
+def test_batch_larger_than_the_cap_is_refused_at_the_edge(batch_client,
+                                                          key_factory):
+    """Over MAX_BATCH is a 422 on shape, before the budget is touched."""
+    from api.main import MAX_BATCH
+
+    raw, key_id = key_factory()
+    r = batch_client(raw, [f"huge{i}@cap.invalid" for i in range(MAX_BATCH + 1)])
+
+    assert r.status_code == 422, r.text
+    assert _used_this_hour(key_id) == 0, (
+        "an oversized batch was charged before being refused"
+    )
+    # And the cap is one full hour's budget, not an independently-drifting 20.
+    assert MAX_BATCH == auth.TRIGGER_RATE_LIMIT_PER_HOUR
+
+
+def test_empty_batch_is_refused(batch_client, key_factory):
+    raw, key_id = key_factory()
+    assert batch_client(raw, []).status_code == 422
+    assert _used_this_hour(key_id) == 0
+
+
+def test_charge_triggers_is_all_or_nothing(key_factory):
+    """The unit-level guarantee the endpoint's atomicity rests on."""
+    raw, key_id = key_factory()
+
+    assert auth.charge_triggers(key_id, 4, limit=10) == 4
+    assert _used_this_hour(key_id) == 4
+
+    with pytest.raises(auth.RateLimitExceeded) as excinfo:
+        auth.charge_triggers(key_id, 7, limit=10)
+
+    e = excinfo.value
+    assert (e.requested, e.used, e.remaining) == (7, 4, 6)
+    assert e.count == 11 and e.limit == 10
+    assert _used_this_hour(key_id) == 4, "a refused charge was partially applied"
+
+    # The exact remainder still fits.
+    assert auth.charge_triggers(key_id, 6, limit=10) == 10
+
+    with pytest.raises(ValueError):
+        auth.charge_triggers(key_id, 0, limit=10)
+
+
+def test_charge_triggers_rolls_the_window_over(key_factory):
+    """A stale window is a spent budget that expired — same rule as singles."""
+    raw, key_id = key_factory()
+    assert auth.charge_triggers(key_id, 3, limit=3) == 3
+
+    with pytest.raises(auth.RateLimitExceeded):
+        auth.charge_triggers(key_id, 1, limit=3)
+
+    execute("UPDATE api_key_rate_limit SET window_start = window_start - "
+            "interval '2 hours' WHERE api_key_id = %s", (key_id,))
+    assert auth.charge_triggers(key_id, 3, limit=3) == 3
+
+
+def test_a_failing_lead_does_not_abort_the_rest_of_the_batch(batch_client,
+                                                             client,
+                                                             key_factory,
+                                                             monkeypatch):
+    """Every lead is accounted for by email — that is what 'no guessing' means."""
+    import ingestion
+
+    real = ingestion.upsert_lead
+
+    def flaky(*, email, **kw):
+        if email == "bad@partial.invalid":
+            raise RuntimeError("ingestion is down for this one")
+        return real(email=email, **kw)
+
+    monkeypatch.setattr(ingestion, "upsert_lead", flaky)
+
+    raw, key_id = key_factory()
+    r = batch_client(raw, ["ok1@partial.invalid", "bad@partial.invalid",
+                           "ok2@partial.invalid"])
+
+    assert r.status_code == 202, r.text
+    body = r.json()
+    assert (body["accepted"], body["failed"]) == (2, 1), body
+
+    by_email = {x["email"]: x for x in body["results"]}
+    assert set(by_email) == {"ok1@partial.invalid", "bad@partial.invalid",
+                             "ok2@partial.invalid"}
+    assert by_email["bad@partial.invalid"]["status"] == "failed"
+    assert by_email["bad@partial.invalid"]["decision_id"] is None
+    assert "ingestion is down" in by_email["bad@partial.invalid"]["detail"]
+    for ok in ("ok1@partial.invalid", "ok2@partial.invalid"):
+        assert by_email[ok]["status"] == "processing"
+        assert by_email[ok]["decision_id"] is not None
+
+    # The whole batch was charged, including the lead that failed: the budget
+    # bounds what a credential may ASK for, and it asked for three.
+    assert _used_this_hour(key_id) == 3

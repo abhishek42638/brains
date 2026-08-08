@@ -38,7 +38,7 @@ import config  # noqa: F401  — loads .env before we read os.environ
 from fastapi import Header, HTTPException
 from pydantic import BaseModel
 
-from db import execute, query
+from db import execute, query, transaction
 
 # The Cloud Scheduler service account allowed to call /internal/sweep. Distinct
 # from the Cloud Tasks account on purpose — see require_scheduler.
@@ -284,12 +284,105 @@ def require_scheduler(authorization: str | None = Header(default=None)) -> dict:
 
 
 class RateLimitExceeded(Exception):
-    """Raised by `charge_trigger` when a key is over its hourly budget."""
+    """Raised by `charge_trigger`/`charge_triggers` when a key is over budget.
 
-    def __init__(self, count: int, limit: int):
+    `count` is what the counter would stand at had the charge been allowed, so
+    a caller can always report it as "you are at N of LIMIT". `requested` and
+    `used` are populated only by the batch path, which knows something the
+    single path does not: how many were asked for, and how many were left. A
+    batch refusal wants to say "you asked for 8 and had 3" rather than "you are
+    over" — the caller's next move depends on the size of the gap.
+    """
+
+    def __init__(self, count: int, limit: int, *, requested: int | None = None,
+                 used: int | None = None):
         self.count = count
         self.limit = limit
+        self.requested = requested
+        self.used = used
         super().__init__(f"{count}/{limit} triggers used this hour")
+
+    @property
+    def remaining(self) -> int:
+        """How much budget was actually left. Batch path only; else 0."""
+        if self.used is None:
+            return 0
+        return max(0, self.limit - self.used)
+
+
+def charge_triggers(api_key_id: int, n: int, *, limit: int | None = None) -> int:
+    """Charge N triggers against this key's hourly budget, ALL OR NOTHING.
+
+    Returns the new count. Raises RateLimitExceeded — having charged NOTHING —
+    when the key does not have N left this hour.
+
+    THE ALL-OR-NOTHING PART IS THE WHOLE POINT. A batch of N charges N against
+    the same per-key hourly limit a single trigger charges 1 against; there is
+    no separate batch ceiling, because the limit exists to bound what one
+    credential can spend and a batch budget of its own would be a way around it
+    rather than a use of it. Given that, a partial charge would be the worst of
+    both: the caller is refused, and their budget is gone anyway.
+
+    WHY THIS IS NOT `charge_trigger` IN A LOOP. Two reasons, and the second is
+    the one that matters. First, N round trips. Second, `charge_trigger`
+    increments and THEN checks, so a loop that refused on the 4th of 8 would
+    leave 4 charges spent on a batch that never ran — exactly the partial state
+    this must not produce. Rolling them back afterwards is not available either:
+    another request may have charged in between, so "subtract 4" is not the
+    inverse of what we did.
+
+    WHY SELECT ... FOR UPDATE RATHER THAN ONE CLEVER UPSERT. The single-trigger
+    UPSERT can be atomic in one statement because it always applies; this one
+    must decide whether to apply at all, and the decision needs the post-
+    roll-over count. FOR UPDATE serialises concurrent charges on the same key,
+    so two batches of 15 against a 20 budget cannot both read "0 used" and both
+    proceed — the second blocks, then sees 15 and is refused. The whole thing
+    is one transaction, so a refusal rolls back the seed INSERT too.
+
+    The window is the same fixed hour as `charge_trigger` (date_trunc), with the
+    same known looseness across a boundary, and deliberately the same counter
+    row: singles and batches share one budget.
+    """
+    if n < 1:
+        raise ValueError(f"cannot charge {n} triggers")
+
+    limit = TRIGGER_RATE_LIMIT_PER_HOUR if limit is None else limit
+
+    with transaction() as cur:
+        # Ensure a row exists to lock. DO NOTHING rather than an upsert of the
+        # count: this statement establishes the lock target, it does not charge.
+        cur.execute(
+            "INSERT INTO api_key_rate_limit (api_key_id, window_start, count) "
+            "VALUES (%s, date_trunc('hour', now()), 0) "
+            "ON CONFLICT (api_key_id) DO NOTHING",
+            (api_key_id,),
+        )
+        cur.execute(
+            "SELECT count, window_start < date_trunc('hour', now()) AS stale "
+            "FROM api_key_rate_limit WHERE api_key_id = %s FOR UPDATE",
+            (api_key_id,),
+        )
+        row = cur.fetchone()
+
+        # A stale window is a spent budget that has already expired: treat it as
+        # zero here and let the UPDATE below roll the window forward, which is
+        # the same rule the single-trigger UPSERT applies in its CASE.
+        used = 0 if row["stale"] else row["count"]
+
+        if used + n > limit:
+            logger.warning("rate limit: key %s asked for %d with %d/%d used "
+                           "this hour; batch refused whole", api_key_id, n,
+                           used, limit)
+            raise RateLimitExceeded(used + n, limit, requested=n, used=used)
+
+        cur.execute(
+            "UPDATE api_key_rate_limit "
+            "SET count = %s, window_start = date_trunc('hour', now()) "
+            "WHERE api_key_id = %s",
+            (used + n, api_key_id),
+        )
+
+    return used + n
 
 
 def charge_trigger(api_key_id: int, *, limit: int | None = None) -> int:
