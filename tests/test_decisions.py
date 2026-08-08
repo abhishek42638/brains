@@ -222,6 +222,60 @@ def test_a_good_run_completes_through_the_gate(monkeypatch, decision_id):
     assert row["score"] == 90 and row["band"] == "hot"
     assert row["reasoning"]["gate"]["rule"]
     assert result["status"] == row["status"]
+    # Provenance survives into the PERSISTED trace, not just the return value:
+    # the row has to answer "which policy gated this?" long after the process
+    # that decided it is gone, the same way rules_version answers "which rules
+    # scored it?". Org 1 has no settings row, so this is the default policy.
+    assert row["reasoning"]["gate"]["policy_source"] == "defaults"
+
+
+@needs_db
+def test_an_unreadable_policy_holds_the_row_and_says_so_in_the_trace(
+    monkeypatch, decision_id
+):
+    """Fail closed, end to end: a bad migration must not relax the live gate."""
+    from agent import gate
+
+    # A CLEAN run: a company on file and no lost deals or open tickets, so no
+    # blocker fires and the threshold is the only thing between score 90 and
+    # auto_executed. Without this the row would be held by a blocker and the
+    # test would pass without exercising the fail-closed path at all.
+    clean = _ok_run()
+    clean["iterations"] = [
+        {"index": 1, "intent": "", "tool": "lookup_lead", "args": {},
+         "result": {"found": True, "lead": {"id": 1},
+                    "company": {"id": 1, "name": "Acme"}},
+         "is_error": False, "model_latency_ms": 1.0, "tool_latency_ms": 1.0},
+        {"index": 2, "intent": "", "tool": "check_crm", "args": {"lead_id": 1},
+         "result": {"deals": [], "open_tickets": 0},
+         "is_error": False, "model_latency_ms": 1.0, "tool_latency_ms": 1.0},
+        *clean["iterations"],
+    ]
+
+    # Sanity: with settings readable, this exact run DOES auto-execute at 90.
+    _patch_loop(monkeypatch, result=clean)
+    probe = decisions.gather_evidence(clean)
+    assert gate.propose({
+        "score": probe["score"],
+        "proposed_action": clean["proposal"]["proposed_action"],
+        "evidence": probe["evidence"],
+    })["status"] == "auto_executed", "the test's own premise is wrong"
+
+    def boom(*a, **k):
+        raise RuntimeError("relation \"org_settings\" does not exist")
+
+    monkeypatch.setattr(gate, "query", boom)
+
+    decisions.process(decision_id, "stub@test.invalid", org_id=1, role="sales")
+
+    row = _row(decision_id)
+    assert row["status"] == "pending_approval", (
+        "an unreadable policy let a decision auto-execute"
+    )
+    trace = row["reasoning"]["gate"]
+    assert trace["policy_source"] == "fallback_unreadable"
+    assert trace["policy_error"] == "RuntimeError"
+    assert trace["rule"] == "pending:policy_unreadable"
 
 
 # --- A broken run must actually REACH a human ------------------------------- #

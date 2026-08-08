@@ -15,7 +15,22 @@ org_id is.
 functions here, and the transitions are atomic.
 """
 
+import logging
+
 from db import execute, query
+
+logger = logging.getLogger("brains-gate")
+
+# --- Policy provenance -------------------------------------------------------
+#
+# Every gate result carries WHICH policy decided it, for the same reason the
+# decision row carries `rules_version`: an argument about a ruling should be a
+# query, not an archaeology exercise. "It auto-executed at 80" is a different
+# fact from "it auto-executed at 80 because this org's settings were unreadable
+# and it fell back", and only one of them is a bug.
+POLICY_ORG_SETTINGS = "org_settings"   # at least one field came from the org's row
+POLICY_DEFAULTS = "defaults"           # no row, or a row that overrides nothing
+POLICY_UNREADABLE = "fallback_unreadable"  # the read FAILED; see FALLBACK_CONFIG
 
 # --- Default thresholds ------------------------------------------------------
 #
@@ -54,6 +69,28 @@ DEFAULT_BLOCKERS = (
 # shape `propose` wants and the shape the original tests read.
 BLOCKERS = tuple((name, BLOCKER_REGISTRY[name]) for name in DEFAULT_BLOCKERS)
 
+# What the gate falls back to when the settings read FAILS. Not the defaults:
+# BOTH AUTONOMY ENDS ARE SWITCHED OFF and every decision is held for a human.
+#
+# The shipped defaults look conservative and are not. They are conservative only
+# for an org that LOOSENED its policy; for an org sitting at min_score=95, a
+# failed read would auto-execute at 80 — a silent policy loosening, which is
+# precisely the failure class this product exists to prevent. Nor is the window
+# narrow: a missing `org_settings` table is a bad migration with the decision
+# path otherwise healthy, so this is reachable without a database outage.
+#
+# The cost is a full pending queue while settings are unreadable. That is
+# visible and annoying, and it beats invisible and wrong.
+#
+# None thresholds mean "this autonomy end does not exist", not "zero" — see
+# `propose`, which refuses to compare against them.
+FALLBACK_CONFIG = {
+    "AUTO_EXECUTE_MIN_SCORE": None,
+    "AUTO_DISCARD_MAX_SCORE": None,
+    "BLOCKERS": BLOCKERS,
+    "POLICY_SOURCE": POLICY_UNREADABLE,
+}
+
 
 class UnknownBlocker(ValueError):
     """An org's settings named a blocker this build does not implement."""
@@ -86,9 +123,11 @@ def gate_config_for(org_id: int) -> dict:
 
     Returns a dict shaped for `propose(decision, config=...)`:
 
-        {"AUTO_EXECUTE_MIN_SCORE": int,
-         "AUTO_DISCARD_MAX_SCORE": int,
-         "BLOCKERS": ((name, predicate), ...)}
+        {"AUTO_EXECUTE_MIN_SCORE": int | None,
+         "AUTO_DISCARD_MAX_SCORE": int | None,
+         "BLOCKERS": ((name, predicate), ...),
+         "POLICY_SOURCE": one of the POLICY_* constants,
+         "POLICY_ERROR": str, only when the read failed}
 
     THE FALLBACK IS PER-FIELD, NOT PER-ROW. An org_settings row with only
     `auto_execute_min_score` set must not drag the discard floor along with it;
@@ -97,16 +136,21 @@ def gate_config_for(org_id: int) -> dict:
     the default happened to be when the row was written.
 
     NO ROW AT ALL IS NORMAL, not an error: an org that has never opened the
-    settings page gets exactly today's behaviour. Same for a missing table —
-    this returns the defaults rather than failing the decision, because a gate
-    that cannot read its settings should fall back to the shipped policy, not
-    refuse to gate. It does NOT fall back to "no blockers" or "auto-execute
-    everything" in any path: the defaults are the conservative position.
+    settings page gets exactly today's behaviour, and the defaults ARE that
+    org's policy.
+
+    A FAILED READ IS NOT THAT. It returns FALLBACK_CONFIG — every decision held
+    for a human — rather than the defaults, because for an org that raised its
+    threshold the defaults are a silent LOOSENING of a policy it chose. See
+    FALLBACK_CONFIG for the full argument. This function never raises; it
+    reports the failure through POLICY_SOURCE instead, so the fallback is
+    visible on every row it gated rather than only in the logs.
     """
     config = {
         "AUTO_EXECUTE_MIN_SCORE": CONFIG["AUTO_EXECUTE_MIN_SCORE"],
         "AUTO_DISCARD_MAX_SCORE": CONFIG["AUTO_DISCARD_MAX_SCORE"],
         "BLOCKERS": BLOCKERS,
+        "POLICY_SOURCE": POLICY_DEFAULTS,
     }
 
     try:
@@ -115,14 +159,12 @@ def gate_config_for(org_id: int) -> dict:
             "FROM org_settings WHERE org_id = %s",
             (org_id,),
         )
-    except Exception:  # noqa: BLE001 — an unreadable setting is not a failed decision
-        import logging
-
-        logging.getLogger("brains-gate").exception(
-            "could not read org_settings for org %s; using default gate policy",
-            org_id,
+    except Exception as e:  # noqa: BLE001 — reported as policy, never raised
+        logger.exception(
+            "could not read org_settings for org %s; holding every decision "
+            "for a human until it is readable", org_id,
         )
-        return config
+        return {**FALLBACK_CONFIG, "POLICY_ERROR": type(e).__name__}
 
     if not rows:
         return config
@@ -130,13 +172,19 @@ def gate_config_for(org_id: int) -> dict:
     row = rows[0]
     if row["auto_execute_min_score"] is not None:
         config["AUTO_EXECUTE_MIN_SCORE"] = row["auto_execute_min_score"]
+        config["POLICY_SOURCE"] = POLICY_ORG_SETTINGS
     if row["auto_discard_max_score"] is not None:
         config["AUTO_DISCARD_MAX_SCORE"] = row["auto_discard_max_score"]
+        config["POLICY_SOURCE"] = POLICY_ORG_SETTINGS
     if row["blockers"] is not None:
         # An explicit empty list is a real choice — "this org blocks on
         # nothing" — and is distinct from NULL, which means "not configured".
         config["BLOCKERS"] = resolve_blockers(row["blockers"])
+        config["POLICY_SOURCE"] = POLICY_ORG_SETTINGS
 
+    # A row that exists but overrides nothing leaves POLICY_SOURCE at
+    # 'defaults', because provenance names the policy that ACTUALLY applied —
+    # and an all-NULL row applied none of itself.
     return config
 
 
@@ -189,54 +237,63 @@ def propose(decision: dict, config: dict | None = None) -> dict:
     max_discard = config.get("AUTO_DISCARD_MAX_SCORE",
                              CONFIG["AUTO_DISCARD_MAX_SCORE"])
     blockers = config.get("BLOCKERS", BLOCKERS)
+    source = config.get("POLICY_SOURCE", POLICY_DEFAULTS)
+    policy_error = config.get("POLICY_ERROR")
+
+    def ruled(status: str, rule: str, detail: str, fired: list | None = None) -> dict:
+        """Stamp provenance onto every exit. One helper so none can miss it."""
+        out = {
+            "status": status,
+            "rule": rule,
+            "detail": detail,
+            "blockers": fired or [],
+            "policy_source": source,
+        }
+        if policy_error is not None:
+            out["policy_error"] = policy_error
+        return out
 
     fired = [name for name, pred in blockers if pred(evidence)]
 
     if fired:
-        return {
-            "status": "pending_approval",
-            "rule": fired[0],
-            "detail": f"blocked by {', '.join(fired)} (score {score})",
-            "blockers": fired,
-        }
+        return ruled("pending_approval", fired[0],
+                     f"blocked by {', '.join(fired)} (score {score})", fired)
 
-    if score is not None and score >= min_score:
-        return {
-            "status": "auto_executed",
-            "rule": "auto_execute:threshold_met",
-            "detail": f"score {score} >= {min_score} and no blockers",
-            "blockers": [],
-        }
+    # FAIL CLOSED. The policy could not be read, so neither autonomy end is
+    # available: applying the shipped defaults here would gate this org by a
+    # policy it did not choose, and for an org that raised its threshold that
+    # is a silent loosening. Held for a human, and the row says why.
+    if source == POLICY_UNREADABLE:
+        return ruled(
+            "pending_approval", "pending:policy_unreadable",
+            f"gate policy could not be read ({policy_error}); score {score} is "
+            "held for a human rather than judged by a policy this org did not "
+            "choose",
+        )
 
-    if score is not None and score <= max_discard:
+    if min_score is not None and score is not None and score >= min_score:
+        return ruled("auto_executed", "auto_execute:threshold_met",
+                     f"score {score} >= {min_score} and no blockers")
+
+    if max_discard is not None and score is not None and score <= max_discard:
         if action == "discard":
-            return {
-                "status": "auto_discarded",
-                "rule": "auto_discard:below_floor",
-                "detail": (
-                    f"score {score} <= {max_discard}, model proposed discard, "
-                    "no blockers"
-                ),
-                "blockers": [],
-            }
+            return ruled(
+                "auto_discarded", "auto_discard:below_floor",
+                f"score {score} <= {max_discard}, model proposed discard, "
+                "no blockers",
+            )
         # Deterministic floor says discard, but the model proposed something
         # else — the disagreement itself is a reason to gate to a human.
-        return {
-            "status": "pending_approval",
-            "rule": "pending:floor_action_mismatch",
-            "detail": (
-                f"score {score} <= {max_discard} but proposed_action is "
-                f"{action!r}, not discard"
-            ),
-            "blockers": [],
-        }
+        return ruled(
+            "pending_approval", "pending:floor_action_mismatch",
+            f"score {score} <= {max_discard} but proposed_action is "
+            f"{action!r}, not discard",
+        )
 
-    return {
-        "status": "pending_approval",
-        "rule": "pending:below_threshold",
-        "detail": f"score {score} between {max_discard} and {min_score}, no blockers",
-        "blockers": [],
-    }
+    return ruled(
+        "pending_approval", "pending:below_threshold",
+        f"score {score} between {max_discard} and {min_score}, no blockers",
+    )
 
 
 # --- Atomic state transitions (the only DB writes in the gate) ---------------
@@ -328,9 +385,7 @@ def _emit_transition(decision_id: int, new_status: str,
         webhooks.emit_for_status(new_status, decision_id=decision_id,
                                  org_id=target_org)
     except Exception:  # noqa: BLE001 — a webhook must not undo an approval
-        import logging
-
-        logging.getLogger("brains-gate").exception(
+        logger.exception(
             "webhook emission failed for decision %s (%s); the transition "
             "itself stands", decision_id, new_status,
         )

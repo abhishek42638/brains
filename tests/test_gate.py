@@ -379,11 +379,14 @@ def test_org_settings_are_not_shared_between_orgs(settings_for):
     )
 
 
-def test_an_unreadable_settings_table_falls_back_to_the_defaults(monkeypatch):
-    """A gate that cannot read its settings gates by the shipped policy.
+def test_an_unreadable_settings_table_fails_closed(monkeypatch):
+    """A gate that cannot read its settings holds EVERYTHING for a human.
 
-    Not by 'no blockers', and not by refusing to decide — the fallback has to be
-    the conservative direction, since this runs on the decision write path.
+    Not the shipped defaults. The defaults are conservative only for an org that
+    loosened its policy — for an org that tightened one they are a silent
+    LOOSENING, which is the failure class this product exists to prevent. A full
+    pending queue is visible and annoying; a quietly relaxed gate is invisible
+    and wrong.
     """
     def boom(*a, **k):
         raise RuntimeError("relation \"org_settings\" does not exist")
@@ -391,8 +394,93 @@ def test_an_unreadable_settings_table_falls_back_to_the_defaults(monkeypatch):
     monkeypatch.setattr(gate, "query", boom)
 
     config = gate.gate_config_for(1)
-    assert config["AUTO_EXECUTE_MIN_SCORE"] == gate.CONFIG["AUTO_EXECUTE_MIN_SCORE"]
-    assert config["BLOCKERS"] == gate.BLOCKERS
+    assert config["POLICY_SOURCE"] == gate.POLICY_UNREADABLE
+    assert config["POLICY_ERROR"] == "RuntimeError"
+    # Neither autonomy end exists under the fallback.
+    assert config["AUTO_EXECUTE_MIN_SCORE"] is None
+    assert config["AUTO_DISCARD_MAX_SCORE"] is None
+
+    # A score that would sail past the default threshold is held anyway.
+    result = gate.propose(_decision(100), config=config)
+    assert result["status"] == "pending_approval"
+    assert result["rule"] == "pending:policy_unreadable"
+    assert result["policy_source"] == gate.POLICY_UNREADABLE
+    assert result["policy_error"] == "RuntimeError"
+
+    # So is one the default floor would have auto-discarded.
+    discard = gate.propose(_decision(0, proposed_action="discard"), config=config)
+    assert discard["status"] == "pending_approval"
+    assert discard["rule"] == "pending:policy_unreadable"
+
+    # Blockers are still evaluated and still reported — a fired blocker is
+    # information the reviewer wants, and the outcome is pending either way.
+    blocked = gate.propose(_decision(100, has_company=False), config=config)
+    assert blocked["status"] == "pending_approval"
+    assert blocked["rule"] == "blocker:no_company"
+    assert blocked["policy_source"] == gate.POLICY_UNREADABLE
+
+
+def test_a_stricter_org_is_never_silently_loosened_by_a_failed_read(monkeypatch,
+                                                                    settings_for):
+    """The exact case that decided the trade: min_score=95, read fails, 96 in.
+
+    Under a fall-back-to-defaults gate this auto-executes at 80 — the org's own
+    threshold silently relaxed by 15 points, with nothing on the row to say so.
+    """
+    org = settings_for(987662, min_score=95)
+
+    # Sanity: while readable, 96 auto-executes under the org's OWN policy.
+    healthy = gate.gate_config_for(org)
+    assert healthy["POLICY_SOURCE"] == gate.POLICY_ORG_SETTINGS
+    assert gate.propose(_decision(96), config=healthy)["status"] == "auto_executed"
+
+    def boom(*a, **k):
+        raise RuntimeError("relation \"org_settings\" does not exist")
+
+    monkeypatch.setattr(gate, "query", boom)
+
+    config = gate.gate_config_for(org)
+    result = gate.propose(_decision(96), config=config)
+
+    assert result["status"] == "pending_approval", (
+        "a failed settings read silently loosened a stricter org's gate"
+    )
+    assert result["policy_source"] == "fallback_unreadable"
+    assert result["rule"] == "pending:policy_unreadable"
+
+
+# --------------------------------------------------------------------------- #
+# Policy provenance — which policy gated this row?                            #
+# --------------------------------------------------------------------------- #
+
+
+def test_every_gate_result_names_its_policy_source():
+    """Same job as rules_version: turn an argument about a ruling into a query."""
+    for d in (_decision(100), _decision(0, proposed_action="discard"),
+              _decision(50), _decision(0), _decision(100, has_company=False)):
+        assert gate.propose(d)["policy_source"] == gate.POLICY_DEFAULTS
+
+    # And no policy_error key when there was no failure to report.
+    assert "policy_error" not in gate.propose(_decision(100))
+
+
+@needs_db
+def test_policy_source_distinguishes_configured_from_default(settings_for):
+    configured = settings_for(987663, min_score=70)
+    assert gate.gate_config_for(configured)["POLICY_SOURCE"] == (
+        gate.POLICY_ORG_SETTINGS
+    )
     assert gate.propose(
-        _decision(100, has_company=False), config=config
-    )["status"] == "pending_approval"
+        _decision(75), config=gate.gate_config_for(configured)
+    )["policy_source"] == "org_settings"
+
+    assert gate.gate_config_for(987664)["POLICY_SOURCE"] == gate.POLICY_DEFAULTS
+
+
+@needs_db
+def test_a_row_that_overrides_nothing_reports_defaults(settings_for):
+    """Provenance names the policy that APPLIED, and an all-NULL row applied none."""
+    org = settings_for(987665)  # row exists; every column NULL
+    config = gate.gate_config_for(org)
+    assert config["POLICY_SOURCE"] == gate.POLICY_DEFAULTS
+    assert config["AUTO_EXECUTE_MIN_SCORE"] == gate.CONFIG["AUTO_EXECUTE_MIN_SCORE"]
