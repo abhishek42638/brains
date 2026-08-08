@@ -786,6 +786,11 @@ needing `maintenance_work_mem`, and a 7-chunk index is nothing. It is explicitly
 only"), which is the right trade here and the wrong one for production —
 `db-g1-small` (1.7 GB, $32.70/mo) is a `gcloud sql instances patch --tier=` away.
 
+## What's next
+
+Horizon 1, the demo assets held below the line, and what is already done and
+should stop being proposed: **[docs/roadmap.md](docs/roadmap.md)** (v1.1).
+
 ## License
 
 Copyright (C) 2026 Abhishek Baiplawat.
