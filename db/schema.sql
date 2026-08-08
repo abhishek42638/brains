@@ -207,3 +207,24 @@ CREATE INDEX IF NOT EXISTS webhook_deliveries_org_idx
     ON webhook_deliveries (org_id, created_at DESC);
 CREATE INDEX IF NOT EXISTS webhook_deliveries_decision_idx
     ON webhook_deliveries (decision_id);
+-- Phase 7: the gate stops being one company's policy compiled into the binary.
+--
+-- One optional row per org. EVERY COLUMN IS NULLABLE ON PURPOSE: NULL means
+-- "not configured, use the shipped default", and `gate.gate_config_for` falls
+-- back per FIELD rather than per row — so an org that raises its auto-execute
+-- threshold does not thereby freeze its discard floor at whatever the default
+-- was on the day the row was written. An org with no row at all gets exactly
+-- today's behaviour, which is why nothing creates one eagerly.
+--
+-- `blockers` is TEXT[] of names from gate.BLOCKER_REGISTRY, and the array ORDER
+-- is the precedence a fired blocker is reported in. Names, not expressions: a
+-- settings row that could carry a predicate would be a code-execution surface
+-- reachable by whoever can write settings. An empty array is a real choice
+-- ("this org blocks on nothing") and is distinct from NULL ("not configured").
+CREATE TABLE IF NOT EXISTS org_settings (
+    org_id INT PRIMARY KEY,
+    auto_execute_min_score INT,
+    auto_discard_max_score INT,
+    blockers TEXT[],
+    updated_at TIMESTAMPTZ NOT NULL DEFAULT now()
+);

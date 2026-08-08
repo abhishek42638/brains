@@ -465,10 +465,17 @@ def process(decision_id: int, email: str, *, org_id: int, role: str) -> dict:
         )
 
     facts = gather_evidence(run)
-    gate_result = gate.propose({
-        "score": facts["score"],
-        "proposed_action": run["proposal"]["proposed_action"],
-        "evidence": facts["evidence"],
-    })
+    # The policy is the ORG's, read here and passed in, so `propose` stays a
+    # pure function of (evidence, policy) with no idea that tenants exist. An
+    # org with no settings row gets the shipped defaults, so this changes
+    # nothing for anyone who has not configured anything.
+    gate_result = gate.propose(
+        {
+            "score": facts["score"],
+            "proposed_action": run["proposal"]["proposed_action"],
+            "evidence": facts["evidence"],
+        },
+        config=gate.gate_config_for(org_id),
+    )
     return _complete(decision_id, org_id=org_id, run=run, facts=facts,
                      gate_result=gate_result)
