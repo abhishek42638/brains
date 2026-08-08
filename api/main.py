@@ -47,6 +47,7 @@ from pydantic import BaseModel, ConfigDict, Field, field_validator
 
 from agent import gate
 from db import query
+from rules import DEFAULT_DECISION_TYPE, known_decision_types
 
 # Fail closed at BOOT, before the app object exists and before anything can take
 # traffic. A deployed service that is configured to emulate — or that is missing
@@ -120,6 +121,23 @@ class TriggerRequest(StrictRequest):
     # as tool output, because nothing looks it up. Capped hardest anyway: it is
     # the most attractive place to paste a wall of text.
     message: str | None = Field(default=None, max_length=5000)
+
+    # WHICH KIND OF DECISION THIS IS — intent, so the caller may say it; but
+    # validated against the registry, so they may not invent one. A type nothing
+    # can score must never be accepted: the row would be filed, run, and scored
+    # by another type's rules, and the number on it would mean nothing while
+    # looking exactly like a number that means something.
+    decision_type: str = Field(default=DEFAULT_DECISION_TYPE, max_length=64)
+
+    @field_validator("decision_type")
+    @classmethod
+    def _known_type(cls, v: str) -> str:
+        if v not in known_decision_types():
+            raise ValueError(
+                f"unknown decision_type {v!r}; "
+                f"known: {', '.join(known_decision_types())}"
+            )
+        return v
 
 
 class TriggerResponse(BaseModel):
@@ -429,9 +447,15 @@ def _ingest_and_dispatch(req: TriggerRequest, *, principal: Principal,
 
     decision_id = decisions.create_processing(
         org_id=principal.org_id,
+        decision_type=req.decision_type,
         trigger_input={
             "email": req.email,
             "source": "api",
+            # Stamped in the trigger_input as well as the column: the column is
+            # what the system reads, this is what the caller asked for, and
+            # keeping both means a later change to how types are resolved cannot
+            # rewrite the record of what was requested.
+            "decision_type": req.decision_type,
             # Audit: which credential asked for this. The key id, never the key.
             "api_key_id": principal.api_key_id,
             "triggers_used_this_hour": triggers_used,

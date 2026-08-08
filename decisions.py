@@ -51,7 +51,8 @@ import logging
 from psycopg.types.json import Json
 
 from agent import gate
-from db import execute
+from db import execute, query
+from rules import DEFAULT_DECISION_TYPE
 
 logger = logging.getLogger("brains-decisions")
 if not logger.handlers:
@@ -103,21 +104,40 @@ def _emit(status: str, *, decision_id: int, org_id: int) -> None:
                          "decision itself is unaffected", decision_id, status)
 
 
-def create_processing(*, org_id: int, trigger_input: dict, identity: dict) -> int:
+def create_processing(*, org_id: int, trigger_input: dict, identity: dict,
+                      decision_type: str = DEFAULT_DECISION_TYPE) -> int:
     """Create a decision in 'processing'. Returns its id.
 
     The identity is stamped at birth so that even a row whose worker never runs
-    records the privilege it was created under.
+    records the privilege it was created under. The decision TYPE is stamped at
+    birth for the same reason and with the same force: it selects the rules that
+    score the row and the policy that gates it, so a row whose type were decided
+    later could be scored by one set of rules and judged by another's thresholds.
     """
     rows = execute(
         "INSERT INTO decisions "
-        "(org_id, trigger_input, proposed_action, reasoning, status) "
-        "VALUES (%s, %s, %s, %s, %s) RETURNING id",
-        (org_id, Json(trigger_input), NO_ACTION,
-         Json({"phase": STATUS_PROCESSING, "identity": identity}),
+        "(org_id, decision_type, trigger_input, proposed_action, reasoning, status) "
+        "VALUES (%s, %s, %s, %s, %s, %s) RETURNING id",
+        (org_id, decision_type, Json(trigger_input), NO_ACTION,
+         Json({"phase": STATUS_PROCESSING, "identity": identity,
+               "decision_type": decision_type}),
          STATUS_PROCESSING),
     )
     return rows[0]["id"]
+
+
+def decision_type_of(decision_id: int, *, org_id: int) -> str:
+    """The stamped type of one decision, or the default if the row is gone.
+
+    Read back from the row rather than threaded through the worker's arguments:
+    the row is what the type was stamped ON, and a task payload that disagreed
+    with it would gate the decision by a policy the record does not mention.
+    """
+    rows = query(
+        "SELECT decision_type FROM decisions WHERE id = %s AND org_id = %s",
+        (decision_id, org_id),
+    )
+    return rows[0]["decision_type"] if rows else DEFAULT_DECISION_TYPE
 
 
 # How long a row may sit in 'processing' before we call it abandoned. Generous:
@@ -363,9 +383,14 @@ def needs_review(
 
 
 def _complete(decision_id: int, *, org_id: int, run: dict, facts: dict,
-              gate_result: dict) -> dict:
+              gate_result: dict,
+              decision_type: str = DEFAULT_DECISION_TYPE) -> dict:
     """Fold a successful run into the row and apply the gate's status."""
     reasoning = {
+        # Which kind of decision this was, next to which policy gated it and
+        # which rules scored it — the three questions a reader of this trace
+        # asks about how the ruling was reached.
+        "decision_type": decision_type,
         "iterations": run["iterations"],
         "final": run["final"],
         "stop_reason": run["stop_reason"],
@@ -465,17 +490,19 @@ def process(decision_id: int, email: str, *, org_id: int, role: str) -> dict:
         )
 
     facts = gather_evidence(run)
-    # The policy is the ORG's, read here and passed in, so `propose` stays a
-    # pure function of (evidence, policy) with no idea that tenants exist. An
-    # org with no settings row gets the shipped defaults, so this changes
-    # nothing for anyone who has not configured anything.
+    # The policy is the ORG's AND THE TYPE'S, read here and passed in, so
+    # `propose` stays a pure function of (evidence, policy) with no idea that
+    # tenants or decision types exist. An org with no settings row for this type
+    # gets the shipped defaults, so this changes nothing for anyone who has not
+    # configured anything.
+    decision_type = decision_type_of(decision_id, org_id=org_id)
     gate_result = gate.propose(
         {
             "score": facts["score"],
             "proposed_action": run["proposal"]["proposed_action"],
             "evidence": facts["evidence"],
         },
-        config=gate.gate_config_for(org_id),
+        config=gate.gate_config_for(org_id, decision_type),
     )
     return _complete(decision_id, org_id=org_id, run=run, facts=facts,
-                     gate_result=gate_result)
+                     gate_result=gate_result, decision_type=decision_type)

@@ -18,6 +18,7 @@ functions here, and the transitions are atomic.
 import logging
 
 from db import execute, query
+from rules import DEFAULT_DECISION_TYPE
 
 logger = logging.getLogger("brains-gate")
 
@@ -118,8 +119,16 @@ def resolve_blockers(names) -> tuple:
     return tuple(resolved)
 
 
-def gate_config_for(org_id: int) -> dict:
-    """Read one org's gate policy, falling back to the defaults field by field.
+def gate_config_for(org_id: int,
+                    decision_type: str = DEFAULT_DECISION_TYPE) -> dict:
+    """Read one org's gate policy FOR ONE DECISION TYPE, defaults field by field.
+
+    The key is (org_id, decision_type), not org_id: two decision types in one
+    tenant are two different judgements, and a per-org key would force one to
+    inherit the other's autonomy settings. An org that has tightened the gate on
+    a high-stakes type must not thereby tighten a routine one, and — the
+    direction that actually matters — loosening a routine type must not loosen
+    the high-stakes one along with it.
 
     Returns a dict shaped for `propose(decision, config=...)`:
 
@@ -156,13 +165,13 @@ def gate_config_for(org_id: int) -> dict:
     try:
         rows = query(
             "SELECT auto_execute_min_score, auto_discard_max_score, blockers "
-            "FROM org_settings WHERE org_id = %s",
-            (org_id,),
+            "FROM org_settings WHERE org_id = %s AND decision_type = %s",
+            (org_id, decision_type),
         )
     except Exception as e:  # noqa: BLE001 — reported as policy, never raised
         logger.exception(
-            "could not read org_settings for org %s; holding every decision "
-            "for a human until it is readable", org_id,
+            "could not read org_settings for org %s / type %s; holding every "
+            "decision for a human until it is readable", org_id, decision_type,
         )
         return {**FALLBACK_CONFIG, "POLICY_ERROR": type(e).__name__}
 

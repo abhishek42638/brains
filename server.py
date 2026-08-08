@@ -65,14 +65,7 @@ from fastmcp import FastMCP
 import config  # noqa: F401  — loads .env before we read os.environ
 
 from db import query
-from rules import (
-    RULES_VERSION,
-    band_for,
-    score_from_revenue,
-    score_from_size,
-    score_from_source,
-    score_from_title,
-)
+from rules import DEFAULT_DECISION_TYPE, entry_for
 
 logger = logging.getLogger("brains-mcp")
 _handler = logging.StreamHandler()  # defaults to sys.stderr
@@ -227,7 +220,8 @@ SCORE_LEAD_SQL = """
 """
 
 
-def _score_lead(lead_id: int, org_id: int) -> dict:
+def _score_lead(lead_id: int, org_id: int,
+                decision_type: str = DEFAULT_DECISION_TYPE) -> dict:
     """Score a lead WITHIN one tenant. Identity is an argument.
 
     lead_id is a global primary key, so ``WHERE l.id = %s`` alone would happily
@@ -239,24 +233,22 @@ def _score_lead(lead_id: int, org_id: int) -> dict:
     points must come from a company in the SAME tenant. has_company keys off the
     joined row, not off company_id, so a cross-org FK scores as "no company"
     rather than silently pulling another tenant's firmographics into the score.
+
+    THE RULES COME FROM THE REGISTRY, keyed by decision_type — including the
+    rules_version, which is the entry's own rather than a module-level constant
+    that would misreport a second type's rules as 1.0.0. Today there is exactly
+    one entry; the resolution is here so that adding a second is a registry
+    change rather than an edit to this function.
     """
+    entry = entry_for(decision_type)  # raises on a type nothing can score
+
     rows = query(SCORE_LEAD_SQL, (lead_id, org_id))
     if not rows:
         logger.info("score_lead: no lead for lead_id=%r org_id=%s", lead_id, org_id)
         return {"found": False}
 
     row = rows[0]
-    has_company = row["company_name"] is not None
-
-    title_pts, title_reason = score_from_title(row["title"])
-    size_pts, size_reason = score_from_size(row["employee_count"], has_company)
-    revenue_pts, revenue_reason = score_from_revenue(
-        row["annual_revenue_usd"], has_company
-    )
-    source_pts, source_reason = score_from_source(row["source"])
-
-    score = title_pts + size_pts + revenue_pts + source_pts
-    reasons = [title_reason, size_reason, revenue_reason, source_reason]
+    scored = entry["score"](row)
 
     return {
         "found": True,
@@ -264,10 +256,11 @@ def _score_lead(lead_id: int, org_id: int) -> dict:
         "email": row["email"],
         "title": row["title"] or "",
         "company": row["company_name"],
-        "score": score,
-        "band": band_for(score),
-        "reasons": reasons,
-        "rules_version": RULES_VERSION,
+        "score": scored["score"],
+        "band": scored["band"],
+        "reasons": scored["reasons"],
+        "rules_version": entry["rules_version"],
+        "decision_type": decision_type,
     }
 
 
@@ -371,7 +364,8 @@ def _search_knowledge(
 
 # --- Server construction: the caller binds identity here, once ---------------
 
-def build_mcp(*, role: str, org_id: int, name: str = "brains-crm") -> FastMCP:
+def build_mcp(*, role: str, org_id: int, name: str = "brains-crm",
+              decision_type: str = DEFAULT_DECISION_TYPE) -> FastMCP:
     """Build a tool gateway bound to ONE identity for its whole lifetime.
 
     `role` and `org_id` are captured in a closure. They are not tool parameters,
@@ -379,11 +373,19 @@ def build_mcp(*, role: str, org_id: int, name: str = "brains-crm") -> FastMCP:
     read nor set them. To act at a different privilege level a caller must build
     a different server, which is code the model does not write.
 
+    `decision_type` is bound the same way and for the same reason: which rules
+    score this lead is not the model's to choose. It is defaulted rather than
+    required because there is exactly one type today — the binding point exists
+    so that a second one is a caller change, not a rewrite of this closure.
+
     Raises ValueError on an unknown role, so a typo fails at construction rather
-    than silently degrading to a search that matches nothing.
+    than silently degrading to a search that matches nothing. Same for an unknown
+    decision_type, via the registry: constructing a gateway that cannot score is
+    a failure worth having at construction rather than mid-run.
     """
     if role not in KNOWN_ROLES:
         raise ValueError(f"unknown role {role!r}; expected one of {KNOWN_ROLES}")
+    entry_for(decision_type)  # raises UnknownDecisionType
 
     mcp = FastMCP(name)
 
@@ -528,7 +530,7 @@ def build_mcp(*, role: str, org_id: int, name: str = "brains-crm") -> FastMCP:
         Use "reasons" verbatim when explaining a decision to a human — it is the
         audit trail, and paraphrasing it breaks the record.
         """
-        return _score_lead(lead_id, org_id=org_id)
+        return _score_lead(lead_id, org_id=org_id, decision_type=decision_type)
 
     @mcp.tool
     def search_knowledge(query_text: str) -> dict:

@@ -278,12 +278,15 @@ def settings_for():
 
     made = []
 
-    def make(org_id, *, min_score=None, max_discard=None, blockers=None):
-        _execute("DELETE FROM org_settings WHERE org_id = %s", (org_id,))
+    def make(org_id, *, min_score=None, max_discard=None, blockers=None,
+             decision_type="lead_qualification"):
+        _execute("DELETE FROM org_settings WHERE org_id = %s AND decision_type = %s",
+                 (org_id, decision_type))
         _execute(
-            "INSERT INTO org_settings (org_id, auto_execute_min_score, "
-            "auto_discard_max_score, blockers) VALUES (%s, %s, %s, %s)",
-            (org_id, min_score, max_discard, blockers),
+            "INSERT INTO org_settings (org_id, decision_type, "
+            "auto_execute_min_score, auto_discard_max_score, blockers) "
+            "VALUES (%s, %s, %s, %s, %s)",
+            (org_id, decision_type, min_score, max_discard, blockers),
         )
         made.append(org_id)
         return org_id
@@ -484,3 +487,62 @@ def test_a_row_that_overrides_nothing_reports_defaults(settings_for):
     config = gate.gate_config_for(org)
     assert config["POLICY_SOURCE"] == gate.POLICY_DEFAULTS
     assert config["AUTO_EXECUTE_MIN_SCORE"] == gate.CONFIG["AUTO_EXECUTE_MIN_SCORE"]
+
+
+# --------------------------------------------------------------------------- #
+# Policy is keyed by (org, decision_type) — phase 7                           #
+# --------------------------------------------------------------------------- #
+
+
+@needs_db
+def test_gate_config_resolves_per_org_and_type(settings_for):
+    """Two types in one tenant are two policies, not one shared by accident."""
+    org = 987670
+    settings_for(org, min_score=95, decision_type="lead_qualification")
+
+    lead = gate.gate_config_for(org, "lead_qualification")
+    assert lead["AUTO_EXECUTE_MIN_SCORE"] == 95
+    assert lead["POLICY_SOURCE"] == gate.POLICY_ORG_SETTINGS
+
+    # The default argument resolves to the same row, so every existing caller
+    # keeps the behaviour it had before the key was widened.
+    assert gate.gate_config_for(org) == lead
+
+
+@needs_db
+def test_another_types_row_does_not_leak_into_lead_qualification(settings_for):
+    """The reason the key is composite, asserted rather than assumed.
+
+    A row written for a hypothetical second type must not become lead
+    qualification's policy — and in the direction that matters, a LOOSER policy
+    on some other type must not loosen this one.
+    """
+    org = 987671
+    settings_for(org, min_score=10, max_discard=90,
+                 decision_type="some_other_type")
+
+    config = gate.gate_config_for(org, "lead_qualification")
+
+    assert config["POLICY_SOURCE"] == gate.POLICY_DEFAULTS, (
+        "another decision type's settings row was read as this type's policy"
+    )
+    assert config["AUTO_EXECUTE_MIN_SCORE"] == gate.CONFIG["AUTO_EXECUTE_MIN_SCORE"]
+    assert config["AUTO_DISCARD_MAX_SCORE"] == gate.CONFIG["AUTO_DISCARD_MAX_SCORE"]
+
+    # A score of 50 would auto-execute under the other type's threshold of 10.
+    assert gate.propose(_decision(50), config=config)["status"] == "pending_approval"
+
+    # And the other type's row is still readable as its own policy — the two
+    # coexist under one org, which is the point of the composite key.
+    other = gate.gate_config_for(org, "some_other_type")
+    assert other["AUTO_EXECUTE_MIN_SCORE"] == 10
+
+
+@needs_db
+def test_the_same_org_can_hold_a_policy_per_type(settings_for):
+    org = 987672
+    settings_for(org, min_score=95, decision_type="lead_qualification")
+    settings_for(org, min_score=55, decision_type="renewal_risk")
+
+    assert gate.gate_config_for(org, "lead_qualification")["AUTO_EXECUTE_MIN_SCORE"] == 95
+    assert gate.gate_config_for(org, "renewal_risk")["AUTO_EXECUTE_MIN_SCORE"] == 55

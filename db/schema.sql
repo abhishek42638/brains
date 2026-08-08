@@ -228,3 +228,53 @@ CREATE TABLE IF NOT EXISTS org_settings (
     blockers TEXT[],
     updated_at TIMESTAMPTZ NOT NULL DEFAULT now()
 );
+
+-- Phase 7 (decision types): a decision is OF A TYPE, and lead qualification is
+-- the first one rather than the only one.
+--
+-- ALTER rather than a column in the CREATE above, for the reason stated at
+-- companies.domain: this file is applied to databases that already exist, where
+-- CREATE TABLE IF NOT EXISTS is a no-op and a new column in the body would
+-- silently never appear.
+--
+-- NOT NULL with a DEFAULT backfills every existing row in one statement: every
+-- decision taken before this column existed was a lead qualification, so the
+-- default is not a placeholder, it is the correct historical value.
+ALTER TABLE decisions ADD COLUMN IF NOT EXISTS decision_type TEXT NOT NULL
+    DEFAULT 'lead_qualification';
+
+-- The console lists by (org, type, newest first); status is already covered by
+-- decisions_org_status_idx.
+CREATE INDEX IF NOT EXISTS decisions_org_type_created_idx
+    ON decisions (org_id, decision_type, created_at DESC);
+
+-- Gate policy is per (org, decision_type), not per org: two decision types in
+-- one tenant are two different judgements with two different thresholds, and a
+-- single-column key would force one to inherit the other's autonomy settings.
+--
+-- DONE NOW, WHILE THE TABLE IS EMPTY. org_settings has zero rows today, so this
+-- is a metadata change; in a month, with tenants' policies in it, the same
+-- change is a data migration that has to invent a decision_type for every
+-- existing row. The cost of widening a key only ever goes up.
+ALTER TABLE org_settings ADD COLUMN IF NOT EXISTS decision_type TEXT NOT NULL
+    DEFAULT 'lead_qualification';
+
+-- Swap the primary key (org_id) -> (org_id, decision_type), but only if it has
+-- not already been swapped. The guard matters because the alternative — an
+-- unconditional DROP and re-ADD — would rebuild the index on every single run
+-- of `deploy.sh migrate`, taking a lock each time for no change at all.
+DO $$
+BEGIN
+    IF NOT EXISTS (
+        SELECT 1
+        FROM pg_constraint c
+        JOIN pg_class t ON t.oid = c.conrelid
+        WHERE t.relname = 'org_settings'
+          AND c.contype = 'p'
+          AND array_length(c.conkey, 1) = 2
+    ) THEN
+        ALTER TABLE org_settings DROP CONSTRAINT IF EXISTS org_settings_pkey;
+        ALTER TABLE org_settings
+            ADD CONSTRAINT org_settings_pkey PRIMARY KEY (org_id, decision_type);
+    END IF;
+END $$;

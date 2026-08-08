@@ -922,9 +922,17 @@ def test_the_audit_question_is_answerable_from_the_row_alone(monkeypatch):
 #: below is the thing standing between "we widened intent" and "someone added an
 #: identity field and the suite stayed green". A new field here must be a
 #: deliberate edit to this list, made by someone who has read what follows it.
+#: `decision_type` was added in phase 7 and belongs here, having been checked
+#: against the rule this list exists to enforce. It says WHAT KIND of decision
+#: the caller wants, which is intent in the same way `source` is. It cannot be
+#: used to assert privilege: it is validated against rules.REGISTRY at the edge,
+#: so the only accepted values are types this build ships, and what it selects
+#: is a scoring function and a policy key — never a role, never a tenant. An org
+#: still cannot reach another org's settings row through it, because the policy
+#: lookup keys on (org_id FROM THE CREDENTIAL, decision_type).
 TRIGGER_INTENT_FIELDS = {
     "email", "full_name", "title", "company_name", "company_domain",
-    "source", "message",
+    "source", "message", "decision_type",
 }
 
 #: Names that assert WHO the caller is rather than WHAT they want. None of these
