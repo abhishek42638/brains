@@ -46,7 +46,7 @@ from fastapi import Depends, FastAPI, Header, HTTPException
 from pydantic import BaseModel, ConfigDict, Field, field_validator
 
 from agent import gate
-from db import query
+from db import execute, query
 from rules import DEFAULT_DECISION_TYPE, known_decision_types
 
 # Fail closed at BOOT, before the app object exists and before anything can take
@@ -210,6 +210,51 @@ class DecisionDetail(DecisionSummary):
     reasoning: dict
     decided_by: str | None
     decided_at: str | None
+    # Newest first, so `outcomes[0]` is the current truth and the rest are the
+    # history of corrections that led to it. See OUTCOME_VALUES.
+    outcomes: list["OutcomeRecord"] = []
+
+
+# --- Outcome capture: what actually happened ---------------------------------
+#
+# The closed set of things an outcome may be. Deliberately small and deliberately
+# in code rather than a CHECK constraint: it will grow as real workflows arrive,
+# and growing it should be a code change with a test rather than a migration
+# that must reach a live database before the new value can be recorded.
+OUTCOME_VALUES = ("contacted", "qualified", "converted", "lost", "invalid")
+
+
+class OutcomeRequest(StrictRequest):
+    """One thing that happened to a lead, reported by whoever knows.
+
+    `recorded_by` is audit, not authentication — the credential already says
+    which org and which key. This says which human or system claims the fact,
+    which is what you want when two outcomes disagree.
+    """
+
+    outcome: str = Field(max_length=32)
+    value_usd: int | None = Field(default=None, ge=0)
+    note: str | None = Field(default=None, max_length=2000)
+    recorded_by: str = Field(min_length=1, max_length=200)
+
+    @field_validator("outcome")
+    @classmethod
+    def _known_outcome(cls, v: str) -> str:
+        if v not in OUTCOME_VALUES:
+            raise ValueError(
+                f"unknown outcome {v!r}; known: {', '.join(OUTCOME_VALUES)}"
+            )
+        return v
+
+
+class OutcomeRecord(BaseModel):
+    id: int
+    decision_id: int
+    outcome: str
+    value_usd: int | None
+    note: str | None
+    recorded_by: str
+    created_at: str
 
 
 # --- The internal worker endpoint --------------------------------------------
@@ -644,6 +689,88 @@ def get_decision(
         reasoning=r["reasoning"],
         decided_by=r["decided_by"],
         decided_at=r["decided_at"].isoformat() if r["decided_at"] else None,
+        outcomes=_outcomes_for(decision_id, org_id=principal.org_id),
+    )
+
+
+def _outcomes_for(decision_id: int, *, org_id: int) -> list[OutcomeRecord]:
+    """This decision's outcomes, NEWEST FIRST.
+
+    Newest first is the append-only table's read side: the first element is the
+    current truth and everything after it is the history of corrections. The
+    org clause is redundant with the caller's 404 check today, and stays because
+    a read that is only safe because of a check somewhere else is one refactor
+    away from not being safe.
+    """
+    rows = query(
+        "SELECT id, decision_id, outcome, value_usd, note, recorded_by, created_at "
+        "FROM outcomes WHERE decision_id = %s AND org_id = %s "
+        "ORDER BY created_at DESC, id DESC",
+        (decision_id, org_id),
+    )
+    return [
+        OutcomeRecord(
+            id=r["id"], decision_id=r["decision_id"], outcome=r["outcome"],
+            value_usd=r["value_usd"], note=r["note"],
+            recorded_by=r["recorded_by"],
+            created_at=r["created_at"].isoformat(),
+        )
+        for r in rows
+    ]
+
+
+@app.post("/decisions/{decision_id}/outcome", response_model=OutcomeRecord,
+          status_code=201)
+def record_outcome(
+    decision_id: int, req: OutcomeRequest,
+    principal: Principal = Depends(require_principal),
+) -> OutcomeRecord:
+    """Record what actually happened. Append-only; corrections are new rows.
+
+    APPEND-ONLY IS THE POINT, not a simplification. There is no UPDATE and no
+    DELETE here: a correction is another row and the latest row wins. Ground
+    truth that can be edited in place is not ground truth, and the whole reason
+    this table exists is that Horizon 3's agreement analytics have to be able to
+    trust it — "Brains agreed with your team on X% of decisions" is worth
+    nothing if the record it is computed from could have been quietly rewritten.
+    Keeping the superseded rows also keeps the correction visible, which is
+    usually the interesting part: somebody marked this converted, then lost.
+
+    ORG-SCOPED IN THE WHERE, like every other decision route: an org-2 key
+    naming an org-1 decision gets a 404 that is indistinguishable from a
+    decision that does not exist. Confirming the id is real would be its own
+    small leak.
+
+    NO TRIGGER-BUDGET CHARGE. The hourly limit exists to bound what a credential
+    can spend on model calls, and recording an outcome spends nothing. Throttling
+    the data we most want — the ground truth that every later measurement rests
+    on — would be the wrong failure in the wrong direction.
+    """
+    # The decision must exist IN THIS ORG before anything is written; the insert
+    # itself carries the org from the credential, never from the row, so a
+    # mismatch cannot file one org's outcome under another's id.
+    owned = query(
+        "SELECT id FROM decisions WHERE id = %s AND org_id = %s",
+        (decision_id, principal.org_id),
+    )
+    if not owned:
+        raise HTTPException(status_code=404, detail="decision not found in this org")
+
+    rows = execute(
+        "INSERT INTO outcomes "
+        "(org_id, decision_id, outcome, value_usd, note, recorded_by) "
+        "VALUES (%s, %s, %s, %s, %s, %s) "
+        "RETURNING id, decision_id, outcome, value_usd, note, recorded_by, created_at",
+        (principal.org_id, decision_id, req.outcome, req.value_usd, req.note,
+         req.recorded_by),
+    )
+    r = rows[0]
+    logger.info("outcome %r recorded for decision %s in org %s by %r",
+                req.outcome, decision_id, principal.org_id, req.recorded_by)
+    return OutcomeRecord(
+        id=r["id"], decision_id=r["decision_id"], outcome=r["outcome"],
+        value_usd=r["value_usd"], note=r["note"], recorded_by=r["recorded_by"],
+        created_at=r["created_at"].isoformat(),
     )
 
 

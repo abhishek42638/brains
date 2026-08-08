@@ -278,3 +278,39 @@ BEGIN
             ADD CONSTRAINT org_settings_pkey PRIMARY KEY (org_id, decision_type);
     END IF;
 END $$;
+
+-- Phase 7 (outcome capture): ground truth. What actually HAPPENED to the lead,
+-- as opposed to what the system decided about it.
+--
+-- APPEND-ONLY. There is no UPDATE path and no DELETE path to this table, by
+-- design and not by omission: a correction is a NEW ROW, and the latest row for
+-- a decision wins. Ground truth that can be edited in place is not ground
+-- truth — Horizon 3's agreement analytics ("Brains agreed with your team on X%
+-- of decisions") is only worth reporting if the record it is computed from
+-- cannot have been quietly rewritten after the fact. Keeping the earlier rows
+-- also keeps the correction itself visible, which is usually the interesting
+-- part: somebody marked this converted and then marked it lost.
+--
+-- `outcome` is validated in the API against a small closed set (contacted,
+-- qualified, converted, lost, invalid) rather than by a CHECK constraint here.
+-- The set will grow as real workflows arrive, and growing it should be a code
+-- change with a test, not a migration that has to be applied to a live database
+-- before the new value can be recorded.
+--
+-- ON DELETE CASCADE would be wrong here: an outcome outliving its decision is
+-- meaningless, but so is silently discarding ground truth, so the FK is a plain
+-- reference and decisions are not deleted in this system anyway.
+CREATE TABLE IF NOT EXISTS outcomes (
+    id SERIAL PRIMARY KEY,
+    org_id INT NOT NULL,
+    decision_id INT NOT NULL REFERENCES decisions(id),
+    outcome TEXT NOT NULL,             -- see OUTCOME_VALUES in api/main.py
+    value_usd BIGINT,                  -- deal value where one applies
+    note TEXT,
+    recorded_by TEXT NOT NULL,         -- who says so; audit, not authentication
+    created_at TIMESTAMPTZ NOT NULL DEFAULT now()
+);
+
+-- The read is always "this org's outcomes for this decision, newest first".
+CREATE INDEX IF NOT EXISTS outcomes_org_decision_idx
+    ON outcomes (org_id, decision_id, created_at DESC);
