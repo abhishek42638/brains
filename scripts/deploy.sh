@@ -14,10 +14,15 @@
 #     app, so omitting it fails. Always pass it.
 #
 # Usage:
-#   ./scripts/deploy.sh              # everything
-#   ./scripts/deploy.sh infra        # up to Cloud Run, no migrate/seed
-#   ./scripts/deploy.sh migrate      # schema + seed + ingest against Cloud SQL
+#   ./scripts/deploy.sh              # everything, including the migration
+#   ./scripts/deploy.sh infra        # same, minus the migration
+#   ./scripts/deploy.sh migrate      # db/schema.sql against Cloud SQL
+#   ./scripts/deploy.sh seed         # db/seed.sql against Cloud SQL (demo data)
 #   ./scripts/deploy.sh keys         # mint prod API keys (prints raw keys ONCE)
+#   ./scripts/deploy.sh url          # print the service URL
+#
+# usage() below is the same list. Keep the three in step — see the comment on
+# the case statement in main() for why that is called out twice.
 #
 set -euo pipefail
 
@@ -54,9 +59,11 @@ SQL_EDITION="ENTERPRISE"              # REQUIRED on PG16+: default is ENTERPRISE
 SQL_STORAGE_SIZE="10GB"
 SQL_STORAGE_TYPE="SSD"
 SQL_CONNECTION_NAME="${PROJECT_ID}:${REGION}:${SQL_INSTANCE}"
-# Local port for the Cloud SQL Auth Proxy that `keys` runs (see mint_keys).
+# Local port for the Cloud SQL Auth Proxy. Shared by `keys`, `migrate` and
+# `seed` — every subcommand that needs a real connection to the production
+# database goes through the proxy, and none of them touch authorized networks.
 # Deliberately not 5432 — that is docker-compose's local Postgres.
-KEYS_PROXY_PORT=5433
+PROXY_PORT=5433
 
 # --- Service accounts (dedicated, least privilege; never the default compute SA) ---
 RUN_SA="brains-run"                   # the API's own identity
@@ -435,16 +442,153 @@ setup_scheduler() {
 }
 
 # ---------------------------------------------------------------------------
+# Everything that stands the service up, with no data migration in it. `all`
+# calls this and then migrate(); `infra` calls it alone. One definition, so the
+# two can no longer claim to differ while doing the same thing.
+infra() {
+  enable_apis
+  setup_registry
+  build_push
+  setup_service_accounts
+  setup_secrets
+  setup_sql
+  setup_tasks
+  deploy_run
+  setup_scheduler
+}
+
+# ---------------------------------------------------------------------------
+# The Cloud SQL Auth Proxy, shared by every subcommand that needs a real
+# connection to the production database.
+#
+# WHY NOT `gcloud sql connect`, which migrate() used to use: it works by adding
+# this machine's public IP to the instance's authorized networks for a few
+# minutes, then shelling out to psql. That breaks the invariant setup_sql()
+# rests on — the authorized networks list stays EMPTY, so the public IP answers
+# to nobody — and it breaks it at the worst possible moment, because if psql is
+# not installed the command fails AFTER the IP has been authorized and there is
+# nothing left running to remove it. It also silently requires a postgres client
+# that this repo otherwise has no need for.
+#
+# The proxy needs no authorized networks at all: it authenticates with IAM and
+# reuses this machine's own credentials. It does need Application Default
+# Credentials, which are NOT the same as `gcloud auth login` — see the error
+# message below, which has cost enough time to be worth spelling out.
+PROXY_PID=""
+
+start_proxy() {
+  command -v cloud-sql-proxy >/dev/null || {
+    echo "ERROR: cloud-sql-proxy not on PATH."
+    echo "  install:  brew install cloud-sql-proxy"
+    exit 1
+  }
+  gcloud auth application-default print-access-token >/dev/null 2>&1 || {
+    echo "ERROR: no Application Default Credentials."
+    echo "  fix:  gcloud auth application-default login"
+    echo "  NOTE: 'gcloud auth login' is a DIFFERENT credential and is not enough."
+    exit 1
+  }
+
+  cloud-sql-proxy --port "${PROXY_PORT}" "${SQL_CONNECTION_NAME}" &
+  PROXY_PID=$!
+  # Double quotes so the pid is expanded NOW and baked into the trap. Single
+  # quotes would defer the lookup to EXIT, by which point the variable may be
+  # gone, and under `set -u` the trap would die and take a successful run's
+  # exit status with it.
+  trap "kill ${PROXY_PID} 2>/dev/null || true" EXIT
+
+  # The proxy binds its listener only once it is ready to serve, so a successful
+  # connect IS the readiness signal. /dev/tcp is a bash builtin — no nc needed.
+  # The pid check leads the loop so a dead proxy is caught before anything is
+  # allowed to answer on the port.
+  log "waiting for the proxy on 127.0.0.1:${PROXY_PORT}"
+  local i
+  for i in $(seq 1 40); do
+    kill -0 "${PROXY_PID}" 2>/dev/null || { echo "ERROR: proxy exited"; exit 1; }
+    (exec 3<>"/dev/tcp/127.0.0.1/${PROXY_PORT}") 2>/dev/null && break
+    sleep 0.5
+    [ "${i}" -lt 40 ] || { echo "ERROR: proxy did not come up"; exit 1; }
+  done
+}
+
+stop_proxy() {
+  [ -n "${PROXY_PID}" ] || return 0
+  kill "${PROXY_PID}" 2>/dev/null || true
+  wait "${PROXY_PID}" 2>/dev/null || true
+  PROXY_PID=""
+  trap - EXIT
+}
+
+# ---------------------------------------------------------------------------
 migrate() {
-  log "Applying schema + seed to Cloud SQL via the connector"
-  # Uses `gcloud sql connect`, which authorizes this machine's IP temporarily.
-  # For CI you would run the Cloud SQL Auth Proxy instead.
+  log "Applying db/schema.sql to Cloud SQL via the Auth Proxy"
   local db_password
   db_password="$(gcloud secrets versions access latest --secret="${SECRET_DB_PASSWORD}")"
-  PGPASSWORD="${db_password}" gcloud sql connect "${SQL_INSTANCE}" \
-    --user="${SQL_USER}" --database="${SQL_DB}" --quiet < db/schema.sql
-  PGPASSWORD="${db_password}" gcloud sql connect "${SQL_INSTANCE}" \
-    --user="${SQL_USER}" --database="${SQL_DB}" --quiet < db/seed.sql || true
+
+  start_proxy
+
+  # psycopg rather than psql: the proxy removes the need to authorize an IP, but
+  # not the need for a client, and this repo already depends on psycopg while it
+  # does not depend on a postgres CLI. `uv run` is the same entry point mint_keys
+  # uses. PGPASSWORD keeps the credential out of the URL that lands in errors.
+  #
+  # schema.sql is CREATE ... IF NOT EXISTS throughout, so this is idempotent and
+  # safe to re-run; it adds what is missing and leaves everything else alone.
+  DATABASE_URL="postgresql://${SQL_USER}@127.0.0.1:${PROXY_PORT}/${SQL_DB}" \
+    PGPASSWORD="${db_password}" \
+    uv run python - <<'PY'
+import os, re, sys
+import psycopg
+
+sql = open("db/schema.sql").read()
+with psycopg.connect(os.environ["DATABASE_URL"]) as conn:
+    with conn.cursor() as cur:
+        cur.execute(sql)
+    conn.commit()
+
+    # VERIFY. Applying DDL without checking what landed is how a migration gets
+    # reported as done when it silently did nothing — every table in the file
+    # must actually be present afterwards, or this exits non-zero.
+    expected = set(re.findall(r"CREATE TABLE IF NOT EXISTS (\w+)", sql))
+    with conn.cursor() as cur:
+        cur.execute("SELECT tablename FROM pg_tables WHERE schemaname = 'public'")
+        present = {r[0] for r in cur.fetchall()}
+
+missing = sorted(expected - present)
+if missing:
+    sys.exit(f"MIGRATION VERIFY FAILED: missing tables {missing}")
+print(f"verified {len(expected)} tables present: {', '.join(sorted(expected))}")
+PY
+
+  stop_proxy
+  log "migration complete"
+}
+
+# ---------------------------------------------------------------------------
+seed() {
+  log "Applying db/seed.sql to Cloud SQL via the Auth Proxy"
+  local db_password
+  db_password="$(gcloud secrets versions access latest --secret="${SECRET_DB_PASSWORD}")"
+
+  start_proxy
+
+  # `|| true`: seed.sql is demo data, and re-running it bounces off unique
+  # constraints on rows that already exist. That is an expected outcome of
+  # re-seeding, not a failure of the deploy — which is exactly why this is its
+  # own subcommand rather than something `migrate` drags along, where a tolerated
+  # error would sit next to DDL whose errors must NOT be tolerated.
+  DATABASE_URL="postgresql://${SQL_USER}@127.0.0.1:${PROXY_PORT}/${SQL_DB}" \
+    PGPASSWORD="${db_password}" \
+    uv run python -c "
+import os, psycopg
+with psycopg.connect(os.environ['DATABASE_URL']) as conn:
+    with conn.cursor() as cur:
+        cur.execute(open('db/seed.sql').read())
+    conn.commit()
+print('seed applied')
+" || log "seed reported errors (expected when the demo rows already exist)"
+
+  stop_proxy
 }
 
 # ---------------------------------------------------------------------------
@@ -460,55 +604,22 @@ mint_keys() {
   # Printing to the operator's terminal and nowhere else keeps that property.
   # Nothing below redirects, tees, or captures stdout.
   #
-  # `gcloud sql connect` (what migrate() uses) is not an option here: it only
-  # wraps psql with a temporarily-authorized IP, and seed_keys.py needs psycopg
-  # to reach the DB, which needs a real local endpoint. Authorizing our own IP
-  # instead would break the invariant setup_sql() rests on — the authorized
-  # networks list stays empty, so the public IP answers to nobody — and a crash
-  # between patch and un-patch would leave the DB exposed with no one watching.
-  # The Auth Proxy needs no authorized networks at all: it authenticates with
-  # IAM ("validates connections using credentials for a user or service
-  # account") and reuses this machine's gcloud credentials, so the operator's
-  # own roles/cloudsql.client is what opens the connection. Verified:
-  # docs.cloud.google.com/sql/docs/postgres/connect-auth-proxy
-  command -v cloud-sql-proxy >/dev/null || {
-    echo "ERROR: cloud-sql-proxy not on PATH."
-    echo "  install:  brew install cloud-sql-proxy"
-    echo "  or see:   docs.cloud.google.com/sql/docs/postgres/connect-auth-proxy"
-    exit 1
-  }
+  # The Auth Proxy, not `gcloud sql connect`: seed_keys.py needs psycopg, which
+  # needs a real local endpoint, and authorizing our own IP would break the
+  # empty-authorized-networks invariant. See start_proxy for the full argument —
+  # it is shared with migrate() and seed() so there is one copy of it.
+  #
+  # Port 5433 rather than 5432 is a safety choice, not a courtesy:
+  # docker-compose's local Postgres owns 5432, so on 5432 the proxy would lose
+  # the bind, the readiness probe would happily connect to the LOCAL dev
+  # database instead, and seed_keys.py would mint production keys into a docker
+  # volume and print them as though they were real.
   command -v uv >/dev/null || { echo "ERROR: uv not on PATH"; exit 1; }
 
   local db_password
   db_password="$(gcloud secrets versions access latest --secret="${SECRET_DB_PASSWORD}")"
 
-  # v2 takes the instance connection name positionally; v1's -instances=...=tcp:PORT
-  # is gone. Port 5433, not 5432, and that is a safety choice rather than a
-  # courtesy: docker-compose's local Postgres owns 5432, so on 5432 the proxy
-  # would lose the bind, the readiness probe below would happily connect to the
-  # LOCAL dev database instead, and seed_keys.py would mint production keys into
-  # a docker volume and print them as though they were real. The pid check
-  # leading the loop is the other half of that guard — a dead proxy is caught
-  # before anything is allowed to answer on the port.
-  cloud-sql-proxy --port "${KEYS_PROXY_PORT}" "${SQL_CONNECTION_NAME}" &
-  local proxy_pid=$!
-  # Double quotes so ${proxy_pid} is expanded NOW and the literal pid is baked
-  # into the trap. Single quotes would defer the lookup to EXIT — which fires
-  # after this function has returned and its `local` is gone, so under `set -u`
-  # the trap itself would die on an unbound variable and take the exit status
-  # to 1 on a perfectly successful run.
-  trap "kill ${proxy_pid} 2>/dev/null || true" EXIT
-
-  # The proxy binds its listener only once it is ready to serve, so a successful
-  # connect IS the readiness signal. /dev/tcp is a bash builtin — no nc dependency.
-  log "waiting for the proxy on 127.0.0.1:${KEYS_PROXY_PORT}"
-  local i
-  for i in $(seq 1 40); do
-    kill -0 "${proxy_pid}" 2>/dev/null || { echo "ERROR: proxy exited"; exit 1; }
-    (exec 3<>"/dev/tcp/127.0.0.1/${KEYS_PROXY_PORT}") 2>/dev/null && break
-    sleep 0.5
-    [ "${i}" -lt 40 ] || { echo "ERROR: proxy did not come up"; exit 1; }
-  done
+  start_proxy
 
   # DATABASE_URL and PGPASSWORD are passed as REAL environment variables, which
   # is load-bearing rather than stylistic: config.py loads .env with
@@ -519,9 +630,11 @@ mint_keys() {
   # The password rides in PGPASSWORD, not in the URL — same split as
   # deploy_revision() and migrate(), and it keeps the credential out of the URL
   # that gets echoed around in errors.
-  DATABASE_URL="postgresql://${SQL_USER}@127.0.0.1:${KEYS_PROXY_PORT}/${SQL_DB}" \
+  DATABASE_URL="postgresql://${SQL_USER}@127.0.0.1:${PROXY_PORT}/${SQL_DB}" \
     PGPASSWORD="${db_password}" \
     uv run python seed_keys.py
+
+  stop_proxy
 
   # Idempotent by seed_keys.py's own rule: the two keys are matched by name and
   # skipped when present, so a re-run prints nothing and mints nothing. Rotating
@@ -530,32 +643,49 @@ mint_keys() {
 
 usage() {
   cat <<EOF
-usage: $0 [all|infra|migrate|keys|url]
+usage: $0 [all|infra|migrate|seed|keys|url]
 
-  all      registry, image, SAs, secrets, SQL, tasks, run, scheduler
-  infra    same as all, minus migrate
-  migrate  schema.sql + seed.sql against Cloud SQL
+  all      infra, then migrate — a complete deploy from nothing
+  infra    registry, image, SAs, secrets, SQL, tasks, run, scheduler. NO migration
+  migrate  db/schema.sql against Cloud SQL, via the Auth Proxy, verified
+  seed     db/seed.sql against Cloud SQL (demo data; safe to re-run)
   keys     mint production API keys (prints raw keys ONCE)
   url      print the service URL
 EOF
 }
 
+# EVERY SUBCOMMAND IN usage() MUST HAVE A BRANCH HERE — THIS DRIFTED THREE TIMES.
+#
+#   1. `keys` was documented in the header and had no branch at all, so the
+#      documented command silently fell through to usage-and-exit-1.
+#   2. `migrate` and `infra` were documented as different things while sharing
+#      one `all|infra)` branch that ran neither migration.
+#   3. `all` claimed to be a complete deploy while being literally identical to
+#      `infra`, so nobody who trusted it ever migrated.
+#
+# The failure mode is always the same and always quiet: the docs describe a
+# capability the dispatch does not have, and you only find out when the thing
+# you thought ran turns out not to have run. If you add a subcommand, add it in
+# three places — the header comment, usage(), and this case statement.
 main() {
   require_gcloud
   case "${1:-all}" in
-    all|infra)
-      enable_apis
-      setup_registry
-      build_push
-      setup_service_accounts
-      setup_secrets
-      setup_sql
-      setup_tasks
-      deploy_run
-      setup_scheduler
+    all)
+      infra
+      # AFTER the infrastructure exists and BEFORE anyone is told it is done:
+      # the schema has to be in place for the revision that is already serving.
+      # The gate fails closed on an unreadable org_settings, so a deploy that
+      # ran ahead of its migration would hold every decision for a human — safe,
+      # but an outage of the autonomy that is the entire product.
+      migrate
       log "done. service: ${SERVICE_URL}"
       ;;
+    infra)
+      infra
+      log "done (no migration — run '$0 migrate'). service: ${SERVICE_URL}"
+      ;;
     migrate) migrate ;;
+    seed)    seed ;;
     keys)    mint_keys ;;
     url)     gcloud run services describe "${SERVICE_NAME}" --region="${REGION}" \
                --format='value(status.url)' ;;
