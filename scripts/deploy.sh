@@ -549,7 +549,13 @@ with psycopg.connect(os.environ["DATABASE_URL"]) as conn:
     # VERIFY. Applying DDL without checking what landed is how a migration gets
     # reported as done when it silently did nothing — every table in the file
     # must actually be present afterwards, or this exits non-zero.
-    expected = set(re.findall(r"CREATE TABLE IF NOT EXISTS (\w+)", sql))
+    #
+    # Comments are stripped FIRST. schema.sql explains its own idempotency with
+    # the phrase "CREATE TABLE IF NOT EXISTS is a no-op on them", and without
+    # this the verifier reads that sentence as a table named `is` and fails a
+    # migration that worked. Found the hard way, on the first real run.
+    ddl = re.sub(r"--[^\n]*", "", sql)
+    expected = set(re.findall(r"CREATE TABLE IF NOT EXISTS (\w+)", ddl))
     with conn.cursor() as cur:
         cur.execute("SELECT tablename FROM pg_tables WHERE schemaname = 'public'")
         present = {r[0] for r in cur.fetchall()}
