@@ -55,6 +55,44 @@ def client():
     return TestClient(app)
 
 
+# --- The front door --------------------------------------------------------- #
+#
+# `/` and `/console` are the two routes a human reaches before they have a key,
+# and they are exempt from the auth structural test in test_auth.py on identical
+# grounds: neither response contains anything a credential could scope. These
+# tests are the other half of that exemption — they hold the premise up, so that
+# a route which starts carrying tenant data fails here rather than staying quietly
+# exempt.
+
+def test_the_bare_url_says_where_to_go(client):
+    """A curious reader pastes the service URL first. 404 was the wrong answer."""
+    r = client.get("/")
+    assert r.status_code == 200
+    assert r.json() == {"service": "brains", "console": "/console",
+                        "docs": "/docs"}
+
+
+def test_the_front_door_carries_no_tenant_data(client):
+    """The premise of the auth exemption: three constant strings, nothing else.
+
+    Served unauthenticated, so anything org-shaped that appeared in it would be
+    readable by anyone. Asserting the body EXACTLY — rather than that some keys
+    are present — is what makes a later addition a failure instead of a leak.
+    """
+    body = client.get("/").json()
+    assert set(body) == {"service", "console", "docs"}
+    assert all(isinstance(v, str) for v in body.values())
+    # The paths it advertises are real and equally keyless.
+    assert client.get(body["console"]).status_code == 200
+    assert client.get(body["docs"]).status_code == 200
+
+
+def test_the_front_door_is_not_a_way_into_the_data(client):
+    """Naming /console and /docs must not imply anything else opened up."""
+    assert client.get("/decisions").status_code == 401
+    assert client.get("/webhooks").status_code == 401
+
+
 # --- It is served, and it is static ----------------------------------------- #
 
 def test_the_page_is_served_without_a_credential(client):

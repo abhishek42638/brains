@@ -215,8 +215,15 @@ def test_the_route_list_has_no_unauthenticated_endpoint():
     # already protected where the data is. tests/test_console.py holds that
     # invariant up — if the page ever starts carrying data, that is where it
     # breaks, and this exemption stops being correct.
+    #
+    # / is the service pointer: three constant strings naming the console and
+    # the docs, so that the bare URL answers something better than 404. Exempt on
+    # the same grounds and with the same condition — it is safe unauthenticated
+    # only while it carries nothing tenant-scoped, and
+    # test_console.py::test_the_front_door_carries_no_tenant_data is what fails
+    # if that ever changes.
     exempt = {"/openapi.json", "/docs", "/docs/oauth2-redirect", "/redoc",
-              "/console"}
+              "/console", "/"}
     for route in app.routes:
         dependant = getattr(route, "dependant", None)
         if dependant is None or route.path in exempt:

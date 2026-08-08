@@ -667,6 +667,27 @@ def pending(
     return [_summary(r) for r in rows]
 
 
+@app.get("/", include_in_schema=False)
+def root() -> dict:
+    """Where to go next. No data, no credential, no tenant.
+
+    A curious reader pastes the bare service URL into a browser before they read
+    anything, and until this existed they got `{"detail":"Not Found"}` — which
+    says the service is up and nothing else, and reads exactly like a broken
+    deployment to someone who does not know the paths.
+
+    SERVED UNAUTHENTICATED for the same reason /console is: the response is three
+    constant strings. There is no org in it, no decision, and nothing a
+    credential could scope, so a key check here would protect nothing that is not
+    already protected where the data is.
+
+    Deliberately a body rather than a 302 to /console. `curl $URL` is how the
+    other half of the audience arrives, and redirecting them into a page of HTML
+    answers a question they did not ask; a pointer answers both.
+    """
+    return {"service": "brains", "console": "/console", "docs": "/docs"}
+
+
 # The console page, read once at import rather than per request: it is a static
 # file that cannot change without a redeploy, and re-reading it on every GET
 # would be a filesystem hit on a path that exists to be fast and boring.
