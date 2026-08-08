@@ -2,6 +2,30 @@
 
 A lead-qualification agent that **proposes**, and deterministic code that **disposes**.
 
+## See it
+
+**Live console** — <https://brains-api-xubjv7k5xq-el.a.run.app/console>
+
+A read-only viewer over the decisions table. The page is served without a
+credential because it contains no data: it asks for an API key, holds it in
+memory only, and every call it then makes is authorized server-side like any
+other. **You need a key to see anything in it**, so the two screens are below.
+
+![The decision list: one row per decision, with status, score, band and type](docs/img/console-list.png)
+
+![Mark's detail view: the gate's rule and policy source, the evidence it saw, the model's proposal, and the tool trace](docs/img/console-detail-mark.png)
+
+**3-minute demo:** [link]
+<!-- record per docs/demo.md, then replace -->
+
+**Demo runbook** — [docs/demo.md](docs/demo.md). Five beats, every command
+literal, roughly six minutes end to end.
+
+**Roadmap** — [docs/roadmap.md](docs/roadmap.md). Horizon 1, the demo assets
+below the line, and what is already done and should stop being proposed.
+
+---
+
 An LLM gathers evidence through MCP tools, then emits a proposal. It never
 executes anything. A rule engine and an approval gate — plain Python, no model
 involved — decide what actually happens, and every decision leaves a queryable
@@ -10,6 +34,45 @@ record of how it was reached and at what privilege.
 The whole system is arranged around one claim: **you should be able to deploy
 this and know what it can and cannot do**, without trusting the model's
 judgement, its honesty, or its resistance to a hostile lead form.
+
+---
+
+## What's here now
+
+Most of what follows was written at phase 5 — API keys, the agent loop, the
+gate, the audit trail — and still describes that core exactly. What has been
+added since is the platform around it: leads arrive in batches, decisions leave
+as signed webhooks, the gate's thresholds are per-tenant rather than compiled
+in, every decision carries a type, what actually happened to a lead can be
+recorded, and there is a page to read all of it. None of it changed the claim
+above; all of it is live in the deployed service.
+
+- **Batch ingestion** — `POST /decisions/trigger/batch`, up to 20 leads in one
+  call. A batch of N charges N against the same per-key hourly budget, and one
+  that would exceed it is refused whole rather than half-run.
+  → [`api/main.py`](api/main.py)
+- **Outbound webhooks** — HMAC-SHA256 signed with the timestamp *inside* the
+  signed string, SSRF-guarded on every attempt rather than at registration,
+  retried through Cloud Tasks, and every outcome is a queryable delivery row.
+  → [`webhooks.py`](webhooks.py)
+- **Per-org gate config** — thresholds and blockers keyed by `(org_id,
+  decision_type)`, defaulted field by field. An unreadable policy **fails
+  closed**: both autonomy ends switch off and everything is held for a human,
+  because falling back to the shipped defaults would silently *loosen* the
+  policy of an org that had tightened it. Every gate result carries
+  `policy_source` saying which policy actually ruled.
+  → [`agent/gate.py`](agent/gate.py)
+- **`decision_type` seam** — a column on `decisions`, a scoring registry keyed
+  by type, gate policy keyed by `(org, type)`. One entry today; the seam was
+  built while the table was empty and the migration was free.
+  → [`rules.py`](rules.py)
+- **Outcome capture** — `POST /decisions/{id}/outcome`, append-only. There is no
+  UPDATE and no DELETE: a correction is a new row and the newest wins, because
+  ground truth you can edit in place is not ground truth.
+  → [`api/main.py`](api/main.py), table in [`db/schema.sql`](db/schema.sql)
+- **Read-only console** — one static HTML file, no build step and no CDN. It
+  renders and does not act; the key lives in memory only.
+  → [`api/console.html`](api/console.html)
 
 ---
 
@@ -685,40 +748,82 @@ That is the same claim the rest of this document makes, now load-bearing for
 input nobody vetted: **a hostile title can talk to the model, but the model has
 no parameter through which to act on it.**
 
+### The whole surface
+
+Every route, and the one door each is behind. `/docs` is the generated version
+of this table; this one exists so the auth column is visible at a glance.
+
+| | route | auth | |
+|---|---|---|---|
+| `GET` | `/` | none | service pointer: names `/console` and `/docs` |
+| `GET` | `/console` | none | the read-only viewer — static markup, no data |
+| `GET` | `/docs` · `/openapi.json` · `/redoc` | none | generated reference |
+| `POST` | `/decisions/trigger` | API key | one lead in → 202 + decision id |
+| `POST` | `/decisions/trigger/batch` | API key | ≤20 leads, one budget, all or nothing |
+| `GET` | `/decisions` | API key | this org's decisions, newest first; filters `status`, `decision_type`, `limit`, `offset` |
+| `GET` | `/decisions/pending` | API key | `pending_approval` **and** `needs_review` — the human queue |
+| `GET` | `/decisions/{id}` | API key | the whole row: trace, evidence, gate, outcomes |
+| `POST` | `/decisions/{id}/approve` · `/reject` | API key | atomic; the second caller gets a 409 |
+| `POST` | `/decisions/{id}/retry` · `/dismiss` | API key | the two exits from `needs_review` |
+| `POST` | `/decisions/{id}/outcome` | API key | append-only ground truth |
+| `GET` | `/decisions/{id}/deliveries` | API key | did the webhook fire? |
+| `POST` `GET` | `/webhooks` | API key | register (secret returned **once**) / list |
+| `GET` `PATCH` `DELETE` | `/webhooks/{id}` | API key | inspect, pause via `active:false`, remove |
+| `POST` | `/internal/process` · `/internal/deliver` | OIDC, tasks SA | Cloud Tasks only — not public, not API-key'd |
+| `POST` | `/internal/sweep` | OIDC, scheduler SA | Cloud Scheduler only, on a *different* service account |
+
+`org_id` appears in no path, no body and no query parameter on any of them. The
+three unauthenticated routes are unauthenticated because they carry nothing a
+credential could scope, and `tests/test_auth.py` fails on any *fourth* route
+that has no auth dependency — the exemption list is short and each entry had to
+be argued for.
+
 ## Layout
 
 ```
-server.py        MCP tool gateway. build_mcp(role, org_id) binds identity in a closure.
-ingestion.py     Leads in. The ONE write path for leads/companies from outside.
-webhooks.py      Events out. SSRF guard, HMAC signing, delivery records.
-agent/loop.py    Hand-rolled Anthropic tool-use loop. Produces the audit trace.
-agent/gate.py    Pure decision logic. LLM proposes, code disposes.
-rules.py         Deterministic scoring. Every point explained.
-decisions.py     The ONE write path for the decisions table. Nothing rests in 'processing'.
-auth.py          API keys (sha256), OIDC for internals, per-key rate limit.
-tasks.py         Cloud Tasks dispatch, with an in-process fallback for local/tests.
-api/main.py      FastAPI. Identity comes from the credential, never the request.
-config.py        The one place .env is loaded. Real env vars always win.
-ingest.py        Chunk + embed the knowledge base. Atomic per doc, backoff on 429.
-db/schema.sql    Postgres + pgvector. The permission filter's home.
+server.py          MCP tool gateway. build_mcp(role, org_id) binds identity in a closure.
+ingestion.py       Leads in. The ONE write path for leads/companies from outside.
+webhooks.py        Events out. SSRF guard, HMAC signing, delivery records.
+agent/loop.py      Hand-rolled Anthropic tool-use loop. Produces the audit trace.
+agent/gate.py      Pure decision logic, plus per-org policy. LLM proposes, code disposes.
+agent/cli.py       The terminal door: qualify, pending, sweep, approve.
+rules.py           Deterministic scoring, and the REGISTRY that selects it by decision type.
+decisions.py       The ONE write path for the decisions table. Nothing rests in 'processing'.
+auth.py            API keys (sha256), OIDC for internals, per-key rate limit.
+tasks.py           Cloud Tasks dispatch, with an in-process fallback for local/tests.
+api/main.py        FastAPI. Identity comes from the credential, never the request.
+                   Outcome capture lives here too — append-only, no UPDATE, no DELETE.
+api/console.html   The read-only viewer. One file, no build step, key in memory only.
+config.py          The one place .env is loaded. Real env vars always win.
+db.py              Connections, query/execute, and the transaction() that makes a
+                   multi-statement write atomic. Every SQL string runs through it.
+ingest.py          Chunk + embed the knowledge base. Atomic per doc, backoff on 429.
+db/schema.sql      Postgres + pgvector. The permission filter's home; org_settings
+                   and outcomes live here too.
+db/seed.sql        The demo fixture. A second org with the same company name and
+                   lead email proves the scoping is composite, not global.
 scripts/deploy.sh  Idempotent GCP provisioning. Every value a variable at the top.
 ```
 
 ## Tests
 
-**296 passing.** They need Postgres, but never GCP and never a live model.
+**377 passing.** They need Postgres, but never GCP and never a live model.
 
 | file | tests | what it pins down |
 |---|---|---|
 | `test_webhooks.py` | 58 | the SSRF guard, the signature, a dead endpoint stalls nothing |
+| `test_auth.py` | 46 | the caller cannot choose its tenant, and no route is accidentally open |
 | `test_permissions.py` | 45 | the model cannot choose its role or tenant |
 | `test_scoring.py` | 39 | rules, every band boundary |
-| `test_auth.py` | 38 | the caller cannot choose its tenant either |
 | `test_ingestion.py` | 38 | a new lead lands in the caller's org and nobody else's |
-| `test_decisions.py` | 30 | nothing is left in `processing` |
+| `test_gate.py` | 34 | the policy, per-org config, fail-closed, atomic transitions |
+| `test_decisions.py` | 31 | nothing is left in `processing` |
 | `test_failclosed.py` | 19 | emulation is an opt-in, never an absence |
-| `test_gate.py` | 13 | the gate's policy + atomic transitions |
+| `test_console.py` | 18 | the viewer persists no key, writes nothing, escapes everything |
+| `test_outcomes.py` | 17 | ground truth is appended, never rewritten |
 | `test_ingest.py` | 11 | backoff, and no half-written docs |
+| `test_decision_types.py` | 10 | the seam holds with one thing on either side of it |
+| `test_deploy_script.py` | 6 | every documented subcommand has a branch that runs |
 | `test_enqueue_failure.py` | 5 | a failed enqueue parks the row, never orphans it |
 
 Where a guarantee mattered, the test was **mutation-checked**: the guard was
@@ -769,13 +874,20 @@ the pricing tables, not estimates.
 | Cloud Tasks | ~240 ops of 1M free | $0.00 |
 | Cloud Scheduler | 1 job of 3 free | $0.00 |
 | Secret Manager | 3 versions of 6 free | $0.00 |
-| Artifact Registry | 0.24 GiB of 0.5 free | $0.00 |
-| **Total** | | **$11.24** |
+| Artifact Registry | 0.87 GB of 0.5 free → 0.37 GB billable @ $0.10/GB | $0.04 |
+| **Total** | | **$11.28** |
 
-**Cloud SQL is 100% of the bill.** Everything else is inside its free tier by one
-to two orders of magnitude — the Cloud Run compute is ~$0.07/mo at list price. So
-the only cost decision that actually matters is not setting `min-instances=1`,
-which would add $13–47/mo and dwarf the rest.
+**Cloud SQL is 99.6% of the bill.** Everything else is inside its free tier or
+just past it — the Cloud Run compute is ~$0.07/mo at list price. So the only cost
+decision that actually matters is not setting `min-instances=1`, which would add
+$13–47/mo and dwarf the rest.
+
+The Artifact Registry line is the one that *moved*, and it is worth naming
+because of why. `deploy.sh` pushes `:latest` on every run, which leaves the
+previous digest behind untagged; twenty-four image versions have accumulated at
+~36 MB each and the repository crossed the 0.5 GB free tier. Four cents is not a
+problem, but the growth is monotonic and nothing currently prunes it — a cleanup
+policy on the repository is the fix, and it is not yet written.
 
 `db-f1-micro` (1 shared vCPU / 0.6 GB) was the bet, and it is **confirmed**:
 pgvector **0.8.1** installs and the HNSW index builds on it —
