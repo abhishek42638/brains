@@ -9,14 +9,8 @@ A lead-qualification agent that **proposes**, and deterministic code that **disp
 A read-only viewer over the decisions table. The page is served without a
 credential because it contains no data: it asks for an API key, holds it in
 memory only, and every call it then makes is authorized server-side like any
-other. **You need a key to see anything in it**, so the two screens are below.
-
-![The decision list: one row per decision, with status, score, band and type](docs/img/console-list.png)
-
-![Mark's detail view: the gate's rule and policy source, the evidence it saw, the model's proposal, and the tool trace](docs/img/console-detail-mark.png)
-
-**3-minute demo:** [link]
-<!-- record per docs/demo.md, then replace -->
+other. **You need a key to see anything in it** — without one it is an empty
+shell, and the runbook below is the guided path through it.
 
 **Demo runbook** — [docs/demo.md](docs/demo.md). Five beats, every command
 literal, roughly six minutes end to end.
