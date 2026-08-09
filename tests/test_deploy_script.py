@@ -21,6 +21,7 @@ import pytest
 
 DEPLOY = Path(__file__).resolve().parent.parent / "scripts" / "deploy.sh"
 REPO = DEPLOY.parent.parent
+README = REPO / "README.md"
 
 #: Printed by the stub `uv` below. Its presence in a run's output means the
 #: subcommand got all the way past start_proxy to the thing that talks to the
@@ -75,6 +76,60 @@ def test_every_branch_is_documented(script):
     assert not undocumented, (
         f"the case statement implements {sorted(undocumented)} which usage() "
         "does not mention — a capability nobody can discover"
+    )
+
+
+@pytest.fixture(scope="module")
+def readme() -> str:
+    return README.read_text()
+
+
+def _readme_deploy_block(readme: str) -> str:
+    """The bash block under README's `### Deploy` heading."""
+    m = re.search(r"### Deploy\n+```bash\n(.*?)```", readme, re.DOTALL)
+    assert m, "README's `### Deploy` bash block could not be located"
+    return m.group(1)
+
+
+def test_the_readme_shows_every_subcommand(script, readme):
+    """The fourth list, and the one a reader actually meets first.
+
+    usage() and the header comment are checked against the dispatch in both
+    directions above, but README's Deploy block was checked in neither — so it
+    drifted the way the other three had: it offered `migrate` as "schema + seed"
+    long after seed became its own subcommand, and never mentioned `seed`,
+    `infra` or `url` at all. Someone reading only the README would not know the
+    commands existed.
+    """
+    block = _readme_deploy_block(readme)
+
+    for name in sorted(_case_branches(script)):
+        if name == "all":
+            # `all` is the default — `./scripts/deploy.sh` with no argument, per
+            # `case "${1:-all}"`. A bare invocation line is how it is shown.
+            assert re.search(r"\./scripts/deploy\.sh\s+#", block), (
+                "README's Deploy block does not show the bare "
+                "`./scripts/deploy.sh` invocation, which is how `all` is run"
+            )
+            continue
+        assert re.search(rf"\./scripts/deploy\.sh\s+{name}\b", block), (
+            f"the dispatch implements {name!r} but README's Deploy block never "
+            "shows it — a capability a README-only reader cannot discover"
+        )
+
+
+def test_the_readme_shows_nothing_that_does_not_exist(script, readme):
+    """And the reverse, which is the original bug in its oldest form.
+
+    `keys` was once documented with no branch behind it. A README that offers a
+    subcommand the dispatch will reject sends the reader to usage-and-exit-1.
+    """
+    block = _readme_deploy_block(readme)
+    shown = set(re.findall(r"\./scripts/deploy\.sh\s+([a-z]+)", block))
+    unknown = shown - _case_branches(script)
+    assert not unknown, (
+        f"README's Deploy block shows {sorted(unknown)}, which the case "
+        "statement does not implement"
     )
 
 

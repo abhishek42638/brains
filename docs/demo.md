@@ -24,8 +24,9 @@ $URL/console
 Leave it on the list view. Every beat below ends by pointing at it.
 
 **Check the budget before recording.** Each trigger charges one of 20 per key
-per hour, and a full run-through spends four. A second take in the same hour is
-fine; a fifth is not. `curl -s "$URL/decisions?limit=1" -H "X-API-Key: $KEY"`
+per hour, and a full run-through spends three — beats 1, 2 and 3. Approving and
+recording an outcome cost nothing. Six takes in the same hour are fine; a
+seventh is not. `curl -s "$URL/decisions?limit=1" -H "X-API-Key: $KEY"`
 costs nothing — only triggers are charged.
 
 ## The five beats
@@ -164,8 +165,10 @@ curl -s -X POST "$URL/decisions/$N/outcome" -H "X-API-Key: $KEY" \
 ```
 
 Refresh the detail pane — it appears under **Outcomes**. Post a second one with
-`{"outcome": "lost"}` and both rows stay, newest first: corrections are new
-rows, because ground truth you can edit in place is not ground truth.
+`{"outcome": "lost", "recorded_by": "abhishek"}` and both rows stay, newest
+first: corrections are new rows, because ground truth you can edit in place is
+not ground truth. `recorded_by` is required on every outcome — it is who claims
+the fact, which is the thing you want when two outcomes disagree.
 
 **The closing line:** every number on that screen came from a rule you can read,
 every action was gated by a threshold you set, and the whole argument is one
@@ -176,7 +179,10 @@ row in a table.
 Triggers are additive — leads are upserted, so re-running creates new decisions
 rather than failing. You only need this if you want a clean list on camera.
 
-Through the Auth Proxy (the same route `deploy.sh migrate` uses):
+Through the Auth Proxy (the same route `deploy.sh migrate` uses). **Kill this
+proxy before running any `deploy.sh` subcommand** — `migrate`, `seed` and `keys`
+each start their own on 5433 and now refuse to run if the port is already held,
+rather than silently reusing whatever is listening:
 
 ```bash
 cloud-sql-proxy --port 5433 "$(gcloud sql instances describe brains-pg \

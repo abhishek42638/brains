@@ -514,10 +514,18 @@ for the cloud — a test must not depend on where it runs.
 ### Deploy
 
 ```bash
-./scripts/deploy.sh          # idempotent; every value is a variable at the top
-./scripts/deploy.sh migrate  # schema + seed against Cloud SQL
+./scripts/deploy.sh          # all: infra, then migrate — a complete deploy
+./scripts/deploy.sh infra    # the same, minus the migration
+./scripts/deploy.sh migrate  # db/schema.sql against Cloud SQL, then verified
+./scripts/deploy.sh seed     # db/seed.sql — demo data, safe to re-run
 ./scripts/deploy.sh keys     # mint production keys (printed once)
+./scripts/deploy.sh url      # print the service URL
 ```
+
+Idempotent throughout; every value is a variable at the top of the script. The
+three that reach Cloud SQL — `migrate`, `seed`, `keys` — open an Auth Proxy on
+port 5433 and **refuse to run if something else already holds it**, rather than
+talking to a listener they did not start.
 
 ### The CLI
 
@@ -805,19 +813,19 @@ docs/              demo.md (the runbook), roadmap.md, and knowledge/ — the RAG
 
 ## Tests
 
-**382 passing** — against a local Postgres, but never GCP and never a live model.
+**384 passing** — against a local Postgres, but never GCP and never a live model.
 
 ```bash
-docker compose up -d && uv run pytest     # 382 passed
+docker compose up -d && uv run pytest     # 384 passed
 ```
 
 Without a database the DB-backed half **skips rather than fails**: a database
 that isn't running is an environment condition, not a broken guarantee. A bare
-`uv run pytest` reports `198 passed, 184 skipped` and says why:
+`uv run pytest` reports `200 passed, 184 skipped` and says why:
 
 ```
 ============================ Postgres not reachable ============================
-180 DB tests skipped. Run `docker compose up -d`, then re-run for the full 382.
+180 DB tests skipped. Run `docker compose up -d`, then re-run for the full 384.
 4 of those also need an embedded knowledge base: `uv run python ingest.py` with
 VOYAGE_API_KEY set.
 ```
@@ -837,8 +845,8 @@ something to retrieve. Everything else is green after `docker compose up -d`.
 | `test_failclosed.py` | 19 | emulation is an opt-in, never an absence |
 | `test_console.py` | 18 | the viewer persists no key, writes nothing, escapes everything |
 | `test_outcomes.py` | 17 | ground truth is appended, never rewritten |
+| `test_deploy_script.py` | 13 | every documented subcommand has a branch that runs, the README shows them all, and no subcommand talks to a proxy it did not start |
 | `test_ingest.py` | 11 | backoff, and no half-written docs |
-| `test_deploy_script.py` | 11 | every documented subcommand has a branch that runs, and no subcommand talks to a proxy it did not start |
 | `test_decision_types.py` | 10 | the seam holds with one thing on either side of it |
 | `test_enqueue_failure.py` | 5 | a failed enqueue parks the row, never orphans it |
 
