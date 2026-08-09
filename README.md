@@ -94,7 +94,7 @@ flowchart TB
         SEC["Secret Manager"]
     end
 
-    DB[("Cloud SQL · Postgres 16 + pgvector<br/>leads · companies · deals · tickets<br/>decisions · api_keys<br/>webhook_endpoints · webhook_deliveries<br/>knowledge_chunks vector(1024)")]
+    DB[("Cloud SQL · Postgres 16 + pgvector<br/>leads · companies · deals · tickets<br/>decisions · outcomes · org_settings<br/>api_keys · api_key_rate_limit<br/>webhook_endpoints · webhook_deliveries<br/>knowledge_chunks vector(1024)")]
 
     ANTH["Anthropic API<br/>claude-sonnet-5"]
     RECV["customer receiver<br/>Make · n8n · Zapier"]
@@ -258,11 +258,12 @@ out of one but in the other is a convention you maintain by remembering.
 
 ### Hand-rolled loop vs. LangChain / an agent framework
 
-The loop is ~150 lines in `agent/loop.py`: send messages, look for
-`stop_reason == "tool_use"`, execute, append `tool_result`, repeat, cap the
-iterations.
+The loop proper is `_drive` in `agent/loop.py` — about 140 lines: send messages,
+look for `stop_reason == "tool_use"`, execute, append `tool_result`, repeat, cap
+the iterations. (The file is 365 lines; the remainder is the proposal parser, the
+identity binding, and the docstrings that explain both.)
 
-A framework would have written those 150 lines for me and taken the trace with
+A framework would have written those 140 lines for me and taken the trace with
 it. What the loop actually produces is not the answer — it is the **audit
 record**: every tool call, every argument, every result, latencies, stop reasons,
 the halt cause. That record is the product here; `decisions.reasoning` is what a
@@ -791,12 +792,15 @@ api/console.html   The read-only viewer. One file, no build step, key in memory 
 config.py          The one place .env is loaded. Real env vars always win.
 db.py              Connections, query/execute, and the transaction() that makes a
                    multi-statement write atomic. Every SQL string runs through it.
-ingest.py          Chunk + embed the knowledge base. Atomic per doc, backoff on 429.
+ingest.py          Chunk + embed docs/knowledge/*.md. Atomic per doc, backoff on 429.
+seed_keys.py       Mint the demo API keys. Prints each raw key once; stores sha256.
 db/schema.sql      Postgres + pgvector. The permission filter's home; org_settings
                    and outcomes live here too.
 db/seed.sql        The demo fixture. A second org with the same company name and
                    lead email proves the scoping is composite, not global.
 scripts/deploy.sh  Idempotent GCP provisioning. Every value a variable at the top.
+docs/              demo.md (the runbook), roadmap.md, and knowledge/ — the RAG
+                   corpus ingest.py embeds, permissioned per role.
 ```
 
 ## Tests
@@ -878,8 +882,8 @@ $13–47/mo and dwarf the rest.
 
 The Artifact Registry line is the one that *moved*, and it is worth naming
 because of why. `deploy.sh` pushes `:latest` on every run, which leaves the
-previous digest behind untagged; twenty-four image versions have accumulated at
-~36 MB each and the repository crossed the 0.5 GB free tier. Four cents is not a
+previous digest behind untagged; twenty-six image versions have accumulated at
+~33 MB each and the repository crossed the 0.5 GB free tier. Four cents is not a
 problem, but the growth is monotonic and nothing currently prunes it — a cleanup
 policy on the repository is the fix, and it is not yet written.
 
