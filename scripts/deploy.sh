@@ -489,6 +489,27 @@ start_proxy() {
     exit 1
   }
 
+  # REFUSE A PORT THAT WAS ALREADY BOUND. This is the first half of proving the
+  # listener we later talk to is OURS, and it is not hypothetical: a proxy left
+  # running by an earlier session holds 5433, our proxy loses the bind and dies
+  # with "address already in use", and every connection below then goes to
+  # whatever instance the OLD proxy serves. That is a migration verified against
+  # the wrong database and reported as complete, or — worse, via mint_keys —
+  # production keys minted into someone else's instance and printed as real.
+  #
+  # It has happened. It was harmless only because the stale proxy happened to
+  # point at this same instance, which is luck and not a property of anything.
+  if (exec 3<>"/dev/tcp/127.0.0.1/${PROXY_PORT}") 2>/dev/null; then
+    echo "ERROR: something is already listening on 127.0.0.1:${PROXY_PORT}."
+    echo "  Almost always a cloud-sql-proxy left over from an earlier session."
+    echo "  Refusing to continue: our proxy could not bind, and every query"
+    echo "  would silently go to whatever instance that listener serves rather"
+    echo "  than ${SQL_CONNECTION_NAME}."
+    echo "  find it:  lsof -nP -iTCP:${PROXY_PORT} -sTCP:LISTEN"
+    echo "  clear it: pkill -f 'cloud-sql-proxy.*${PROXY_PORT}'"
+    exit 1
+  fi
+
   cloud-sql-proxy --port "${PROXY_PORT}" "${SQL_CONNECTION_NAME}" &
   PROXY_PID=$!
   # Double quotes so the pid is expanded NOW and baked into the trap. Single
@@ -499,16 +520,37 @@ start_proxy() {
 
   # The proxy binds its listener only once it is ready to serve, so a successful
   # connect IS the readiness signal. /dev/tcp is a bash builtin — no nc needed.
-  # The pid check leads the loop so a dead proxy is caught before anything is
-  # allowed to answer on the port.
   log "waiting for the proxy on 127.0.0.1:${PROXY_PORT}"
   local i
   for i in $(seq 1 40); do
-    kill -0 "${PROXY_PID}" 2>/dev/null || { echo "ERROR: proxy exited"; exit 1; }
-    (exec 3<>"/dev/tcp/127.0.0.1/${PROXY_PORT}") 2>/dev/null && break
+    kill -0 "${PROXY_PID}" 2>/dev/null || {
+      echo "ERROR: the proxy exited before it was ready."
+      echo "  Run it by hand to see why:"
+      echo "    cloud-sql-proxy --port ${PROXY_PORT} ${SQL_CONNECTION_NAME}"
+      exit 1
+    }
+    if (exec 3<>"/dev/tcp/127.0.0.1/${PROXY_PORT}") 2>/dev/null; then
+      # A connect proves SOMETHING is listening; it does not prove it is ours.
+      # Re-check liveness AFTER the connect, because the leading check above
+      # cannot catch this: on the first pass our proxy has been forked but has
+      # not yet failed its bind, so `kill -0` succeeds, the connect lands on a
+      # foreign listener, and the loop breaks with a doomed pid. Checking on
+      # both sides of the connect is what closes that window — together with
+      # the pre-flight refusal, a live pid here means the port is ours.
+      kill -0 "${PROXY_PID}" 2>/dev/null || {
+        echo "ERROR: the proxy died as the port started answering."
+        echo "  Something else owns 127.0.0.1:${PROXY_PORT}; refusing to use it."
+        echo "  find it:  lsof -nP -iTCP:${PROXY_PORT} -sTCP:LISTEN"
+        exit 1
+      }
+      log "proxy ready on 127.0.0.1:${PROXY_PORT} (pid ${PROXY_PID})"
+      return 0
+    fi
     sleep 0.5
-    [ "${i}" -lt 40 ] || { echo "ERROR: proxy did not come up"; exit 1; }
   done
+
+  echo "ERROR: proxy did not come up on 127.0.0.1:${PROXY_PORT} within 20s"
+  exit 1
 }
 
 stop_proxy() {
@@ -620,6 +662,11 @@ mint_keys() {
   # the bind, the readiness probe would happily connect to the LOCAL dev
   # database instead, and seed_keys.py would mint production keys into a docker
   # volume and print them as though they were real.
+  #
+  # Choosing a quieter port only made that collision rarer, though — it did not
+  # make it detectable, and 5433 collides with the last run's own leftover proxy.
+  # start_proxy now refuses a port it did not bind itself, which is what actually
+  # holds this shut; the port choice is defence in depth behind it.
   command -v uv >/dev/null || { echo "ERROR: uv not on PATH"; exit 1; }
 
   local db_password

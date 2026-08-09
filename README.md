@@ -805,19 +805,19 @@ docs/              demo.md (the runbook), roadmap.md, and knowledge/ — the RAG
 
 ## Tests
 
-**377 passing** — against a local Postgres, but never GCP and never a live model.
+**382 passing** — against a local Postgres, but never GCP and never a live model.
 
 ```bash
-docker compose up -d && uv run pytest     # 377 passed
+docker compose up -d && uv run pytest     # 382 passed
 ```
 
 Without a database the DB-backed half **skips rather than fails**: a database
 that isn't running is an environment condition, not a broken guarantee. A bare
-`uv run pytest` reports `193 passed, 184 skipped` and says why:
+`uv run pytest` reports `198 passed, 184 skipped` and says why:
 
 ```
 ============================ Postgres not reachable ============================
-180 DB tests skipped. Run `docker compose up -d`, then re-run for the full 377.
+180 DB tests skipped. Run `docker compose up -d`, then re-run for the full 382.
 4 of those also need an embedded knowledge base: `uv run python ingest.py` with
 VOYAGE_API_KEY set.
 ```
@@ -838,8 +838,8 @@ something to retrieve. Everything else is green after `docker compose up -d`.
 | `test_console.py` | 18 | the viewer persists no key, writes nothing, escapes everything |
 | `test_outcomes.py` | 17 | ground truth is appended, never rewritten |
 | `test_ingest.py` | 11 | backoff, and no half-written docs |
+| `test_deploy_script.py` | 11 | every documented subcommand has a branch that runs, and no subcommand talks to a proxy it did not start |
 | `test_decision_types.py` | 10 | the seam holds with one thing on either side of it |
-| `test_deploy_script.py` | 6 | every documented subcommand has a branch that runs |
 | `test_enqueue_failure.py` | 5 | a failed enqueue parks the row, never orphans it |
 
 Where a guarantee mattered, the test was **mutation-checked**: the guard was
