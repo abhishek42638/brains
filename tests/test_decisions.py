@@ -455,6 +455,7 @@ def failed_decision(monkeypatch):
         execute("DELETE FROM decisions WHERE id = %s", (did,))
 
 
+@needs_db
 def test_retry_and_dismiss_are_the_only_exits_from_needs_review(failed_decision):
     """approve/reject still refuse — retry/dismiss are why that's now acceptable."""
     from agent import gate

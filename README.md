@@ -805,7 +805,25 @@ docs/              demo.md (the runbook), roadmap.md, and knowledge/ — the RAG
 
 ## Tests
 
-**377 passing.** They need Postgres, but never GCP and never a live model.
+**377 passing** — against a local Postgres, but never GCP and never a live model.
+
+```bash
+docker compose up -d && uv run pytest     # 377 passed
+```
+
+Without a database the DB-backed half **skips rather than fails**: a database
+that isn't running is an environment condition, not a broken guarantee. A bare
+`uv run pytest` reports `193 passed, 184 skipped` and says why:
+
+```
+============================ Postgres not reachable ============================
+180 DB tests skipped. Run `docker compose up -d`, then re-run for the full 377.
+4 of those also need an embedded knowledge base: `uv run python ingest.py` with
+VOYAGE_API_KEY set.
+```
+
+Those last four are the RAG permission tests, which need real embeddings to have
+something to retrieve. Everything else is green after `docker compose up -d`.
 
 | file | tests | what it pins down |
 |---|---|---|

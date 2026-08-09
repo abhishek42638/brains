@@ -423,6 +423,7 @@ def test_an_unreadable_settings_table_fails_closed(monkeypatch):
     assert blocked["policy_source"] == gate.POLICY_UNREADABLE
 
 
+@needs_db
 def test_a_stricter_org_is_never_silently_loosened_by_a_failed_read(monkeypatch,
                                                                     settings_for):
     """The exact case that decided the trade: min_score=95, read fails, 96 in.
